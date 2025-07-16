@@ -23,6 +23,8 @@ require (
 	github.com/prometheus/client_golang v1.22.0
 	github.com/prometheus/common v0.64.0
 	github.com/prometheus/prometheus v0.39.1
+	// wcx 7.16 add
+	github.com/robfig/cron/v3 v3.0.1
 	github.com/spf13/cobra v1.8.1
 	github.com/spf13/pflag v1.0.6
 	github.com/stretchr/testify v1.10.0
@@ -52,6 +54,8 @@ require (
 	stathat.com/c/consistent v1.0.0
 	volcano.sh/apis v1.12.1
 )
+
+require k8s.io/cri-api v0.33.2
 
 require (
 	cel.dev/expr v0.19.1 // indirect
@@ -99,7 +103,6 @@ require (
 	go.opentelemetry.io/auto/sdk v1.1.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.58.0 // indirect
 	k8s.io/cli-runtime v0.33.2 // indirect
-	k8s.io/cri-api v0.33.2 // indirect
 	k8s.io/cri-client v0.0.0 // indirect
 	k8s.io/gengo/v2 v2.0.0-20250531010418-b22feca77200 // indirect
 	sigs.k8s.io/kustomize/api v0.19.0 // indirect
