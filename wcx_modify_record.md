@@ -1,0 +1,2 @@
+- volcano/pkg/controllers/cronjob/utils.go 在删除多余limit的job时，排序依据为CreationTimestamp
+- Job的完成条件判断：Job.JobStatus.JobState.JobPhase = Completed || Failed
