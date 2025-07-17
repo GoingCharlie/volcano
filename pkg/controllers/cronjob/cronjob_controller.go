@@ -80,7 +80,7 @@ func (cc *cronjobcontroller) Initialize(opt *framework.ControllerOption) error {
 
 	factory := opt.VCSharedInformerFactory
 	cc.vcInformerFactory = factory
-	if utilfeature.DefaultFeatureGate.Enabled(features.VolcanoJobSupport) {
+	if utilfeature.DefaultFeatureGate.Enabled(features.VolcanoCronJobSupport) {
 		cc.jobInformer = factory.Batch().V1alpha1().Jobs()
 		cc.jobInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 			AddFunc:    cc.addJob,

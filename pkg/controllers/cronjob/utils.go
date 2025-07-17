@@ -17,7 +17,6 @@ limitations under the License.
 package cronjob
 
 import (
-	"context"
 	"fmt"
 	"time"
 
@@ -28,7 +27,9 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
+
 	batchv1 "volcano.sh/apis/pkg/apis/batch/v1alpha1"
+	vcclientset "volcano.sh/apis/pkg/client/clientset/versioned"
 )
 
 // Utilities for dealing with Jobs and CronJobs and time.
@@ -248,14 +249,10 @@ func (o byJobStartTime) Less(i, j int) bool {
 	// 否则按 CreationTimestamp 排序
 	return o[i].ObjectMeta.CreationTimestamp.Before(&o[j].ObjectMeta.CreationTimestamp)
 }
-func deleteJob(cc *cronjobcontroller, cj *batchv1.CronJob, job *batchv1.Job, recorder record.EventRecorder) bool {
+func deleteJob(vcClient vcclientset.Interface, cj *batchv1.CronJob, job *batchv1.Job, recorder record.EventRecorder) bool {
 
 	// 直接使用控制器持有的 vcClient
-	err := cc.vcClient.BatchV1alpha1().Jobs(job.Namespace).Delete(
-		context.TODO(),
-		job.Name,
-		metav1.DeleteOptions{},
-	)
+	err := deleteJobApi(vcClient, job.Namespace, job.Name)
 	// delete the job itself...
 	if err != nil {
 		recorder.Eventf(cj, corev1.EventTypeWarning, "FailedDelete", "Deleted job: %v", err)
@@ -274,10 +271,55 @@ func deleteFromActiveList(cj *batchv1.CronJob, uid types.UID) {
 	}
 
 	active := cj.Status.Active
-	for i := len(active) - 1; i >= 0; i-- {
-		if active[i].UID == uid {
-			active = append(active[:i], active[i+1:]...)
+	originalLen := len(active)
+	newLen := 0
+
+	for i := 0; i < originalLen; i++ {
+		if active[i].UID != uid {
+			active[newLen] = active[i]
+			newLen++
 		}
 	}
-	cj.Status.Active = active
+
+	if newLen < originalLen {
+		cj.Status.Active = active[:newLen:newLen]
+	}
+}
+func IsJobFinished(job *batchv1.Job) (bool, batchv1.JobPhase) {
+	if job.Status.State.Phase == batchv1.Completed || job.Status.State.Phase == batchv1.Failed {
+		return true, job.Status.State.Phase
+	}
+	return false, ""
+}
+func getJobName(cj *batchv1.CronJob, scheduleTime time.Time) string {
+	return fmt.Sprintf("%s-%d", cj.Name, getTimeHashInMinutes(scheduleTime))
+}
+func getJobFromTemplate(cj *batchv1.CronJob, scheduledTime time.Time) (*batchv1.Job, error) {
+	labels := copyLabels(&cj.Spec.JobTemplate)
+	annotations := copyAnnotations(&cj.Spec.JobTemplate)
+	// We want job names for a given nominal start time to have a deterministic name to avoid the same job being created twice
+	name := getJobName(cj, scheduledTime)
+
+	//ToDo
+	// if utilfeature.DefaultFeatureGate.Enabled(features.CronJobsScheduledAnnotation) {
+
+	// 	timeZoneLocation, err := time.LoadLocation(ptr.Deref(cj.Spec.TimeZone, ""))
+	// 	if err != nil {
+	// 		return nil, err
+	// 	}
+	// 	// Append job creation timestamp to the cronJob annotations. The time will be in RFC3339 form.
+	// 	annotations[batchv1.CronJobScheduledTimestampAnnotation] = scheduledTime.In(timeZoneLocation).Format(time.RFC3339)
+	// }
+
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels:            labels,
+			Annotations:       annotations,
+			Name:              name,
+			CreationTimestamp: metav1.Time{Time: scheduledTime},
+			OwnerReferences:   []metav1.OwnerReference{*metav1.NewControllerRef(cj, controllerKind)},
+		},
+	}
+	cj.Spec.JobTemplate.Spec.DeepCopyInto(&job.Spec)
+	return job, nil
 }
