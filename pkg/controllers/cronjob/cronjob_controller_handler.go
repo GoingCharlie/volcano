@@ -210,13 +210,13 @@ func (cc *cronjobcontroller) cleanupFinishedJobs(cronJob *batchv1.CronJob, jobsT
 			}
 			switch phase {
 			case batchv1.Completed:
-				jobFinishTime := &job.Status.State.LastTransitionTime
+				jobFinishTime := job.Status.State.LastTransitionTime
 				if cronJob.Status.LastSuccessfulTime == nil {
-					cronJob.Status.LastSuccessfulTime = jobFinishTime
+					cronJob.Status.LastSuccessfulTime = &jobFinishTime
 					updateStatus = true
 				}
-				if jobFinishTime != nil && jobFinishTime.After(cronJob.Status.LastSuccessfulTime.Time) {
-					cronJob.Status.LastSuccessfulTime = jobFinishTime
+				if !jobFinishTime.IsZero() && cronJob.Status.LastSuccessfulTime != nil && jobFinishTime.After(cronJob.Status.LastSuccessfulTime.Time) {
+					cronJob.Status.LastSuccessfulTime = &jobFinishTime // 注意：赋值时需要取地址
 					updateStatus = true
 				}
 				successfulJobs = append(successfulJobs, job)
