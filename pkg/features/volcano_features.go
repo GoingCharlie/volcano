@@ -43,6 +43,9 @@ const (
 
 	// ResourceTopology supports resources like cpu/memory topology aware.
 	ResourceTopology featuregate.Feature = "ResourceTopology"
+
+	// VolcanoCronJobSupport can identify and schedule volcano cronjob.
+	VolcanoCronJobSupport featuregate.Feature = "VolcanoCronJobSupport"
 )
 
 func init() {
