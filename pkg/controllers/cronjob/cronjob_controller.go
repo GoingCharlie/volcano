@@ -2,6 +2,7 @@ package cronjob
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -15,7 +16,7 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/cri-api/pkg/errors"
 	"k8s.io/klog/v2"
-	batchv1alpha1 "volcano.sh/apis/pkg/apis/batch/v1alpha1"
+	batchv1 "volcano.sh/apis/pkg/apis/batch/v1alpha1"
 	vcclientset "volcano.sh/apis/pkg/client/clientset/versioned"
 	vcscheme "volcano.sh/apis/pkg/client/clientset/versioned/scheme"
 	vcinformer "volcano.sh/apis/pkg/client/informers/externalversions"
@@ -26,7 +27,7 @@ import (
 )
 
 var (
-	controllerKind = batchv1alpha1.SchemeGroupVersion.WithKind("CronJob")
+	controllerKind = batchv1.SchemeGroupVersion.WithKind("CronJob")
 
 	nextScheduleDelta = 100 * time.Millisecond
 )
@@ -135,75 +136,143 @@ func (cc *cronjobcontroller) processNextReq() bool {
 		return false
 	}
 	defer cc.queue.Done(key)
-	requeueAfter, err := cc.syncCronJob(key)
+
+	requeueAfter, err := cc.sync(key)
 	switch {
 	case err != nil:
 		cc.handleJobError(cc.queue, key, err)
 		return true
 	case requeueAfter != nil:
+		klog.V(4).Infof("Requeueing key %s after %v", key, *requeueAfter)
 		cc.queue.AddAfter(key, *requeueAfter)
 	}
 	cc.queue.Forget(key)
 	return true
 }
-func (cc *cronjobcontroller) syncCronJob(cronJobKey string) (*time.Duration, bool, error) {
-	updateStatus := false
+func (cc *cronjobcontroller) sync(cronJobKey string) (*time.Duration, error) {
 	klog.V(3).Infof("Starting to sync up CronJob <%s>", cronJobKey)
 	defer klog.V(3).Infof("Finished CronJob <%s> sync up", cronJobKey)
 	ns, name, err := cache.SplitMetaNamespaceKey(cronJobKey)
 	if err != nil {
-		return nil, updateStatus, err
+		return nil, err
 	}
 	cronJob, err := cc.cronJobList.CronJobs(ns).Get(name)
 	switch {
 	case errors.IsNotFound(err):
-		klog.Infof("CronJob <%s/%s> not found, err <%s>.",
+		klog.Infof("CronJob <%s> not found, err <%s>.",
 			cronJobKey, err)
-		return nil, updateStatus, nil
+		return nil, nil
 	case err != nil:
-		return nil, updateStatus, err
+		return nil, err
 	}
 
 	if cronJob.DeletionTimestamp != nil {
 		klog.Infof("CronJob <%s> is terminating, skip management process.",
 			cronJobKey)
-		return nil, updateStatus, nil
+		return nil, nil
 	}
-
 	// deep copy cronjob to prevent mutate it
 	cronJob = cronJob.DeepCopy()
-
+	requeueAfter, updateStatus, syncErr := cc.syncCronJob(cronJob)
+	if syncErr != nil {
+		klog.Errorf("Error syncing cronjob %s: %v", cronJobKey, syncErr)
+		return nil, syncErr
+	}
+	if updateStatus {
+		if _, err := cc.vcClient.BatchV1alpha1().CronJobs(ns).UpdateStatus(context.TODO(), cronJob, metav1.UpdateOptions{}); err != nil {
+			klog.Errorf("Failed to update status for CronJob <%s>, err: %v", cronJobKey, err)
+			return nil, syncErr
+		}
+	}
+	return requeueAfter, nil
+}
+func (cc *cronjobcontroller) syncCronJob(cronJob *batchv1.CronJob) (*time.Duration, bool, error) {
+	updateStatus := false
+	now := cc.now()
 	JobsByCronJob, err := cc.getJobsByCronJob(cronJob)
 	if err != nil {
 		return nil, updateStatus, err
 	}
-
 	statusAfterProcessFi := cc.processFinishedJobs(cronJob, JobsByCronJob)
 	statusAfterProcessJobs, err := cc.processCtljobAndAcvJob(cronJob, JobsByCronJob)
+	updateStatus = statusAfterProcessFi || statusAfterProcessJobs
 	if err != nil {
 		klog.V(2).Info("Error reconciling cronjob", "cronjob", klog.KObj(cronJob), "err", err)
-		return nil, statusAfterProcessFi || statusAfterProcessJobs, err
-	} else {
-		if cronJob.Spec.Suspend != nil && *cronJob.Spec.Suspend {
-			klog.V(4).Info("Not starting job because the cron is suspended", "cronjob", klog.KObj(cronJob))
-			return nil, updateStatus, nil
-		}
+		return nil, updateStatus, err
 	}
-	updateStatus = statusAfterProcessFi || statusAfterProcessJobs
-	requeueAfter, updateStatusAfterSync, syncErr := cc.syncCronJob(cronJobCopy, jobsToBeReconciled)
-
-	// Update the CronJob if needed
-	if updateStatus {
-		if _, err := cc.vcClient.BatchV1alpha1().CronJobs(ns).UpdateStatus(context.TODO(), cronJobCopy, metav1.UpdateOptions{}); err != nil {
-			klog.V(2).Info("Unable to update status for cronjob", "cronjob", klog.KObj(cronJob), "resourceVersion", cronJob.ResourceVersion, "err", err)
-			return nil, err
-		}
+	// If the cronjob is suspended, we do not create new jobs.
+	if cronJob.Spec.Suspend != nil && *cronJob.Spec.Suspend {
+		klog.V(4).Info("Not starting job because the cron is suspended", "cronjob", klog.KObj(cronJob))
+		return nil, updateStatus, nil
 	}
 
-	if requeueAfter != nil {
-		klog.V(4).Info("Re-queuing cronjob", "cronjob", klog.KObj(cronJob), "requeueAfter", requeueAfter)
-		return requeueAfter, nil
+	sch, validErr := cc.validateTZandSchedule(cronJob, cc.recorder)
+	if validErr != nil {
+		klog.V(2).Info("Error validating cronjob schedule", "cronjob", klog.KObj(cronJob), "err", validErr)
+		return nil, updateStatus, validErr
 	}
-	// this marks the key done, currently only happens when the cronjob is suspended or spec has invalid schedule format
-	return nil, syncErr
+	scheduledTime, err := nextScheduleTime(cronJob, now, sch, cc.recorder)
+	if err != nil {
+		klog.V(2).Info("Error getting next schedule time", "cronjob", klog.KObj(cronJob), "err", err)
+		cc.recorder.Eventf(cronJob, v1.EventTypeWarning, "InvalidSchedule", "Error getting next schedule time: %v", err)
+		return nil, updateStatus, err
+	}
+	if scheduledTime == nil {
+		klog.V(2).Info("No unmet start times, skipping job creation",
+			"cronjob", klog.KObj(cronJob))
+		t := nextScheduleTimeDuration(cronJob, now, sch)
+		return t, updateStatus, nil
+	}
+
+	if cronJob.Spec.StartingDeadlineSeconds != nil {
+		if now.After(scheduledTime.Add(time.Duration(*cronJob.Spec.StartingDeadlineSeconds) * time.Second)) {
+			klog.V(2).Info("Missed job creation because the starting deadline has passed",
+				"cronjob", klog.KObj(cronJob), "scheduledTime", scheduledTime)
+			cc.recorder.Eventf(cronJob, v1.EventTypeWarning, "StartingDeadlineExceeded", "Missed job creation because the starting deadline has passed: %v", *cronJob.Spec.StartingDeadlineSeconds)
+			t := nextScheduleTimeDuration(cronJob, now, sch)
+			return t, updateStatus, nil
+		}
+	}
+
+	if inActiveListByName(cronJob, &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      getJobName(cronJob, *scheduledTime),
+			Namespace: cronJob.Namespace,
+		}}) || cronJob.Status.LastScheduleTime.Equal(&metav1.Time{Time: *scheduledTime}) {
+		klog.V(4).Info("Not starting job because the scheduled time is already processed", "cronjob", klog.KObj(cronJob), "schedule", scheduledTime)
+		t := nextScheduleTimeDuration(cronJob, now, sch)
+		return t, updateStatus, nil
+	}
+
+	isAddqueueAfter, statusAfterProcessCC, err := cc.processConcurrencyPolicy(cronJob)
+	updateStatus = updateStatus || statusAfterProcessCC
+	if err != nil {
+		return nil, updateStatus, nil
+	}
+	if isAddqueueAfter {
+		t := nextScheduleTimeDuration(cronJob, now, sch)
+		return t, updateStatus, nil
+	}
+
+	job, err := cc.createJob(cronJob, *scheduledTime)
+	if err != nil {
+		return nil, updateStatus, err
+	}
+	if job == nil {
+		t := nextScheduleTimeDuration(cronJob, now, sch)
+		return t, updateStatus, nil
+	}
+	if inActiveList(cronJob, job.UID) {
+		return nil, updateStatus, nil
+	}
+	jobRef, err := getRef(job)
+	if err != nil {
+		klog.V(2).Info("Unable to make object reference", "cronjob", klog.KObj(cronJob), "err", err)
+		return nil, updateStatus, fmt.Errorf("unable to make object reference for job for %s", klog.KObj(cronJob))
+	}
+	cronJob.Status.Active = append(cronJob.Status.Active, convertToVolcanoJobRef(jobRef))
+	cronJob.Status.LastScheduleTime = &metav1.Time{Time: *scheduledTime}
+	updateStatus = true
+	t := nextScheduleTimeDuration(cronJob, now, sch)
+	return t, updateStatus, nil
 }

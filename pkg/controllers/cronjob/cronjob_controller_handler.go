@@ -1,20 +1,25 @@
 package cronjob
 
 import (
+	"fmt"
 	"reflect"
 	"sort"
 	"time"
 
 	"github.com/robfig/cron/v3"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
+	ref "k8s.io/client-go/tools/reference"
 	"k8s.io/client-go/util/workqueue"
-	"k8s.io/cri-api/pkg/errors"
 	"k8s.io/klog/v2"
+	"k8s.io/kubectl/pkg/scheme"
+	"k8s.io/kubernetes/pkg/controller/cronjob/metrics"
 	"k8s.io/utils/ptr"
 	batchv1 "volcano.sh/apis/pkg/apis/batch/v1alpha1"
 	vcclientset "volcano.sh/apis/pkg/client/clientset/versioned"
@@ -32,9 +37,6 @@ func (cc *cronjobcontroller) addJob(obj interface{}) {
 	}
 	cronJob := cc.isControlledBy(job)
 	if cronJob != nil {
-		if cronJob == nil {
-			return
-		}
 		cc.addCronjobcontrollerQueue(cronJob, 0)
 		return
 	}
@@ -281,7 +283,7 @@ func (cc *cronjobcontroller) processCtljobAndAcvJob(cronJob *batchv1.CronJob, Jo
 	return updateStatus, nil
 }
 func IsJobFinished(job *batchv1.Job) (bool, batchv1.JobPhase) {
-	if job.Status.State.Phase == batchv1.Completed || job.Status.State.Phase == batchv1.Failed {
+	if job.Status.State.Phase == batchv1.Completed || job.Status.State.Phase == batchv1.Failed || job.Status.State.Phase == batchv1.Terminated {
 		return true, job.Status.State.Phase
 	}
 	return false, ""
@@ -340,4 +342,122 @@ func deleteJobByApi(vcClient vcclientset.Interface, cc *batchv1.CronJob, job *ba
 	recorder.Eventf(cc, corev1.EventTypeNormal, deleteSuccessEvent,
 		"Deleted job %q", job.Name)
 	return true
+}
+
+func (cc *cronjobcontroller) validateTZandSchedule(cj *batchv1.CronJob, recorder record.EventRecorder) (cron.Schedule, error) {
+	if cj.Spec.TimeZone != nil {
+		timeZone := ptr.Deref(cj.Spec.TimeZone, "")
+		if _, err := time.LoadLocation(timeZone); err != nil {
+			klog.Errorf("Invalid time zone %q in CronJob %s: %v", timeZone, klog.KObj(cj), err)
+			if recorder != nil {
+				recorder.Eventf(cj, corev1.EventTypeWarning, "InvalidTimeZone",
+					"Invalid time zone %q: %v", timeZone, err)
+			}
+			return nil, err
+		}
+	}
+	sch, err := cron.ParseStandard(formatSchedule(cj, recorder))
+	return sch, err
+}
+
+func (cc *cronjobcontroller) processConcurrencyPolicy(cj *batchv1.CronJob) (bool, bool, error) {
+	if cj.Spec.ConcurrencyPolicy == batchv1.ForbidConcurrent {
+		if len(cj.Status.Active) > 0 {
+			klog.V(4).Info("Forbid concurrent jobs for CronJob", "cronjob", klog.KObj(cj))
+			cc.recorder.Eventf(cj, corev1.EventTypeWarning, "ForbidConcurrent",
+				"Skipping job creation because another job is already running")
+		}
+		return true, false, nil
+	}
+
+	if cj.Spec.ConcurrencyPolicy == batchv1.ReplaceConcurrent {
+		updateStatus := false
+		if len(cj.Status.Active) > 0 {
+			klog.V(4).Info("Replacing active job for CronJob", "cronjob", klog.KObj(cj))
+			for _, activeJob := range cj.Status.Active {
+				klog.V(4).Info("Deleting job that was still running at next scheduled start time", "job", klog.KRef(activeJob.Namespace, activeJob.Name))
+				job, err := getJobApi(cc.vcClient, activeJob.Namespace, activeJob.Name)
+				if err != nil {
+					cc.recorder.Eventf(cj, corev1.EventTypeWarning, "FailedGet", "Get job: %v", err)
+					return false, updateStatus, err
+				}
+				if !deleteJob(cc.vcClient, cj, job, cc.recorder) {
+					return false, updateStatus, fmt.Errorf("could not replace job %s/%s", job.Namespace, job.Name)
+				}
+				updateStatus = true
+			}
+		}
+		return false, updateStatus, nil
+	}
+	return false, false, nil
+}
+func (cc *cronjobcontroller) createJob(cronJob *batchv1.CronJob, scheduledTime time.Time) (*batchv1.Job, error) {
+	//TODO 检查这些情况对应的处理是否正确
+	jobTemplate, err := getJobFromTemplate(cronJob, scheduledTime)
+	if err != nil {
+		klog.Errorf("Failed to get job from template for cronjob %s: %v", klog.KObj(cronJob), err)
+		cc.recorder.Eventf(cronJob, corev1.EventTypeWarning, "FailedCreate", "Failed to create job from template: %v", err)
+		return nil, err
+	}
+	job, err := createJobApi(cc.vcClient, cronJob.Namespace, jobTemplate)
+	switch {
+	case errors.HasStatusCause(err, corev1.NamespaceTerminatingCause):
+		klog.V(2).Infof("Namespace %s is terminating, skipping job creation for CronJob %s", cronJob.Namespace, klog.KObj(cronJob))
+		cc.recorder.Eventf(cronJob, corev1.EventTypeWarning, "NamespaceTerminating", "Namespace %s is terminating, skipping job creation", cronJob.Namespace)
+		return nil, err
+	case errors.IsAlreadyExists(err):
+
+		existingJob, err := getJobApi(cc.vcClient, job.Namespace, job.Name)
+		if err != nil {
+			if errors.IsNotFound(err) {
+				klog.Warningf("Job %s disappeared after creation conflict, retrying", job.Name)
+				return nil, err
+			}
+			return nil, fmt.Errorf("failed to fetch conflicting job: %w", err)
+		}
+
+		if !metav1.IsControlledBy(existingJob, cronJob) {
+			cc.recorder.Eventf(cronJob, corev1.EventTypeWarning, "ForeignJob",
+				"Job %s exists but not owned by this CronJob (current owner: %s)",
+				existingJob.Name, metav1.GetControllerOf(existingJob).Name)
+			return nil, nil
+		}
+
+		if isFinished, _ := IsJobFinished(existingJob); isFinished {
+			klog.V(2).Infof("Found finished duplicate job %s", klog.KObj(existingJob))
+			return nil, nil
+		}
+
+		klog.V(2).Infof("Job %s already exists and is managed by this CronJob", klog.KObj(existingJob))
+		return existingJob, nil
+	case err != nil:
+		klog.Errorf("Failed to create job for CronJob %s: %v", klog.KObj(cronJob), err)
+		cc.recorder.Eventf(cronJob, corev1.EventTypeWarning, "FailedCreate", "Failed to create job: %v", err)
+		return nil, err
+	}
+	if !metav1.IsControlledBy(job, cronJob) {
+		cleanupErr := deleteJobApi(cc.vcClient, job.Namespace, job.Name)
+		if cleanupErr != nil {
+			klog.Errorf("Failed to cleanup orphaned job %s: %v", klog.KObj(job), cleanupErr)
+		}
+		return nil, fmt.Errorf("created job missing owner reference")
+	}
+	metrics.CronJobCreationSkew.Observe(job.ObjectMeta.GetCreationTimestamp().Sub(scheduledTime).Seconds())
+	klog.V(2).Infof("Created job %s for CronJob %s", klog.KObj(job), klog.KObj(cronJob))
+	cc.recorder.Eventf(cronJob, corev1.EventTypeNormal, "SuccessfulCreate",
+		"Created job %s for CronJob %s", job.Name, klog.KObj(cronJob))
+	return job, nil
+}
+func getRef(object runtime.Object) (*corev1.ObjectReference, error) {
+	return ref.GetReference(scheme.Scheme, object)
+}
+func convertToVolcanoJobRef(k8sRef *corev1.ObjectReference) batchv1.JobReference {
+	return batchv1.JobReference{
+		Kind:            k8sRef.Kind,
+		Namespace:       k8sRef.Namespace,
+		Name:            k8sRef.Name,
+		UID:             k8sRef.UID,
+		APIVersion:      k8sRef.APIVersion,
+		ResourceVersion: k8sRef.ResourceVersion,
+	}
 }

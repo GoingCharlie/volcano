@@ -7,10 +7,16 @@ import (
 
 	"github.com/robfig/cron/v3"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/ptr"
 	batchv1 "volcano.sh/apis/pkg/apis/batch/v1alpha1"
+	vcclientset "volcano.sh/apis/pkg/client/clientset/versioned"
+	"volcano.sh/volcano/pkg/features"
 )
 
 // Utilities for dealing with Jobs and CronJobs and time.
@@ -203,6 +209,90 @@ func inActiveList(cc *batchv1.CronJob, uid types.UID) bool {
 	return false
 }
 
+// inActiveListByName checks if cronjob's status.active has a job with the same
+// name and namespace.
+func inActiveListByName(cj *batchv1.CronJob, job *batchv1.Job) bool {
+	if cj == nil || job == nil {
+		return false
+	}
+	for _, j := range cj.Status.Active {
+		if j.Name == job.Name && j.Namespace == job.Namespace {
+			return true
+		}
+	}
+	return false
+}
+func getJobName(cj *batchv1.CronJob, scheduleTime time.Time) string {
+	return fmt.Sprintf("%s-%d", cj.Name, getTimeHashInMinutes(scheduleTime))
+}
+func copyLabels(template *batchv1.JobTemplateSpec) labels.Set {
+	l := make(labels.Set)
+	for k, v := range template.Labels {
+		l[k] = v
+	}
+	return l
+}
+func copyAnnotations(template *batchv1.JobTemplateSpec) labels.Set {
+	a := make(labels.Set)
+	for k, v := range template.Annotations {
+		a[k] = v
+	}
+	return a
+}
+func getJobFromTemplate(cj *batchv1.CronJob, scheduledTime time.Time) (*batchv1.Job, error) {
+	labels := copyLabels(&cj.Spec.JobTemplate)
+	annotations := copyAnnotations(&cj.Spec.JobTemplate)
+	// We want job names for a given nominal start time to have a deterministic name to avoid the same job being created twice
+	name := getJobName(cj, scheduledTime)
+
+	//ToDo
+	if utilfeature.DefaultFeatureGate.Enabled(features.VolcanoCronJobSupport) {
+
+		timeZoneLocation, err := time.LoadLocation(ptr.Deref(cj.Spec.TimeZone, ""))
+		if err != nil {
+			return nil, err
+		}
+		// Append job creation timestamp to the cronJob annotations. The time will be in RFC3339 form.
+		annotations[batchv1.CronJobScheduledTimestampAnnotation] = scheduledTime.In(timeZoneLocation).Format(time.RFC3339)
+	}
+
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels:            labels,
+			Annotations:       annotations,
+			Name:              name,
+			CreationTimestamp: metav1.Time{Time: scheduledTime},
+			OwnerReferences:   []metav1.OwnerReference{*metav1.NewControllerRef(cj, controllerKind)},
+		},
+	}
+	cj.Spec.JobTemplate.Spec.DeepCopyInto(&job.Spec)
+	return job, nil
+}
+
+// getTimeHashInMinutes returns Unix Epoch Time in minutes
+func getTimeHashInMinutes(scheduledTime time.Time) int64 {
+	return scheduledTime.Unix() / 60
+}
+
+type byJobStartTime []*batchv1.Job
+
+func (o byJobStartTime) Len() int      { return len(o) }
+func (o byJobStartTime) Swap(i, j int) { o[i], o[j] = o[j], o[i] }
+
+func (o byJobStartTime) Less(i, j int) bool {
+	if o[i].ObjectMeta.CreationTimestamp.IsZero() && !o[j].ObjectMeta.CreationTimestamp.IsZero() {
+		return false
+	}
+	if !o[i].ObjectMeta.CreationTimestamp.IsZero() && o[j].ObjectMeta.CreationTimestamp.IsZero() {
+		return true
+	}
+	if o[i].ObjectMeta.CreationTimestamp.Equal(&o[j].ObjectMeta.CreationTimestamp) {
+		return o[i].Name < o[j].Name
+	}
+	return o[i].ObjectMeta.CreationTimestamp.Before(&o[j].ObjectMeta.CreationTimestamp)
+}
+
+// ours
 func deleteFromActiveList(cc *batchv1.CronJob, uid types.UID) {
 	if cc == nil || uid == "" || len(cc.Status.Active) == 0 {
 		return
@@ -223,20 +313,20 @@ func deleteFromActiveList(cc *batchv1.CronJob, uid types.UID) {
 	}
 }
 
-type byJobStartTime []*batchv1.Job
-
-func (o byJobStartTime) Len() int      { return len(o) }
-func (o byJobStartTime) Swap(i, j int) { o[i], o[j] = o[j], o[i] }
-
-func (o byJobStartTime) Less(i, j int) bool {
-	if o[i].ObjectMeta.CreationTimestamp.IsZero() && !o[j].ObjectMeta.CreationTimestamp.IsZero() {
+func deleteJob(vcClient vcclientset.Interface, cj *batchv1.CronJob, job *batchv1.Job, recorder record.EventRecorder) bool {
+	if vcClient == nil || job == nil || cj == nil {
 		return false
 	}
-	if !o[i].ObjectMeta.CreationTimestamp.IsZero() && o[j].ObjectMeta.CreationTimestamp.IsZero() {
-		return true
+	err := deleteJobApi(vcClient, job.Namespace, job.Name)
+	// delete the job itself...
+	if err != nil {
+		recorder.Eventf(cj, corev1.EventTypeWarning, "FailedDelete", "Deleted job: %v", err)
+		klog.Error(err, "Error deleting job from cronjob", "job", klog.KObj(job), "cronjob", klog.KObj(cj))
+		return false
 	}
-	if o[i].ObjectMeta.CreationTimestamp.Equal(&o[j].ObjectMeta.CreationTimestamp) {
-		return o[i].Name < o[j].Name
-	}
-	return o[i].ObjectMeta.CreationTimestamp.Before(&o[j].ObjectMeta.CreationTimestamp)
+	// ... and its reference from active list
+	deleteFromActiveList(cj, job.ObjectMeta.UID)
+	recorder.Eventf(cj, corev1.EventTypeNormal, "SuccessfulDelete", "Deleted job %v", job.Name)
+
+	return true
 }
