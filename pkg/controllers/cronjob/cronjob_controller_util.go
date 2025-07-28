@@ -245,7 +245,6 @@ func getJobFromTemplate(cj *batchv1.CronJob, scheduledTime time.Time) (*batchv1.
 	// We want job names for a given nominal start time to have a deterministic name to avoid the same job being created twice
 	name := getJobName(cj, scheduledTime)
 
-	//ToDo
 	if utilfeature.DefaultFeatureGate.Enabled(features.VolcanoCronJobSupport) {
 
 		timeZoneLocation, err := time.LoadLocation(ptr.Deref(cj.Spec.TimeZone, ""))
@@ -318,13 +317,13 @@ func deleteJob(vcClient vcclientset.Interface, cj *batchv1.CronJob, job *batchv1
 		return false
 	}
 	err := deleteJobApi(vcClient, job.Namespace, job.Name)
-	// delete the job itself...
+
 	if err != nil {
 		recorder.Eventf(cj, corev1.EventTypeWarning, "FailedDelete", "Deleted job: %v", err)
 		klog.Error(err, "Error deleting job from cronjob", "job", klog.KObj(job), "cronjob", klog.KObj(cj))
 		return false
 	}
-	// ... and its reference from active list
+
 	deleteFromActiveList(cj, job.ObjectMeta.UID)
 	recorder.Eventf(cj, corev1.EventTypeNormal, "SuccessfulDelete", "Deleted job %v", job.Name)
 

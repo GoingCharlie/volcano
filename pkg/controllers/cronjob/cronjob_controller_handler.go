@@ -185,16 +185,17 @@ func (cc *cronjobcontroller) processFinishedJobs(cronJob *batchv1.CronJob, JobsB
 	successfulJobs := []*batchv1.Job{}
 
 	for _, job := range JobsByCronJob {
-		isFinish, phase := IsJobFinished(job)
+		isFinish, phase := isJobFinished(job)
 		if isFinish {
-			found := inActiveList(cronJob, job.ObjectMeta.UID)
-			if found {
+			//remove from active list if job is finished
+			if found := inActiveList(cronJob, job.ObjectMeta.UID); found {
 				deleteFromActiveList(cronJob, job.ObjectMeta.UID)
 				cc.recorder.Eventf(cronJob, corev1.EventTypeNormal, "SawCompletedJob", "Saw completed job: %s", job.Name)
 				updateStatus = true
 			}
 			switch phase {
 			case batchv1.Completed:
+				// If the job is successful, update the last successful time
 				jobFinishTime := job.Status.State.LastTransitionTime
 				if cronJob.Status.LastSuccessfulTime == nil {
 					cronJob.Status.LastSuccessfulTime = &jobFinishTime
@@ -210,6 +211,8 @@ func (cc *cronjobcontroller) processFinishedJobs(cronJob *batchv1.CronJob, JobsB
 			}
 		}
 	}
+
+	//delete old jobs
 	if cronJob.Spec.FailedJobsHistoryLimit == nil && cronJob.Spec.SuccessfulJobsHistoryLimit == nil {
 		return false
 	}
@@ -229,13 +232,17 @@ func (cc *cronjobcontroller) processFinishedJobs(cronJob *batchv1.CronJob, JobsB
 
 	return updateStatus
 }
-func (cc *cronjobcontroller) processCtljobAndAcvJob(cronJob *batchv1.CronJob, JobsByCronJob []*batchv1.Job) (bool, error) {
+
+// 1. Identifies and handles orphaned jobs (jobs owned by the CronJob but not in its active list)
+// 2. Cleans up stale references in the CronJob's active list (jobs that no longer exist or have mismatched UIDs)
+func (cc *cronjobcontroller) processCtljobAndActiveJob(cronJob *batchv1.CronJob, JobsByCronJob []*batchv1.Job) (bool, error) {
 	updateStatus := false
 	ctrlJobs := make(map[types.UID]bool)
+
 	for _, job := range JobsByCronJob {
 		ctrlJobs[job.UID] = true
 		found := inActiveList(cronJob, job.ObjectMeta.UID)
-		isFinish, _ := IsJobFinished(job)
+		isFinish, _ := isJobFinished(job)
 		if !found && !isFinish {
 			cjCopy, err := getCronJobApi(cc.vcClient, cronJob.Namespace, cronJob.Name)
 			if err != nil {
@@ -250,6 +257,7 @@ func (cc *cronjobcontroller) processCtljobAndAcvJob(cronJob *batchv1.CronJob, Jo
 				job.Name, job.UID)
 		}
 	}
+
 	for _, activeRef := range cronJob.Status.Active {
 		if _, managed := ctrlJobs[activeRef.UID]; managed {
 			continue
@@ -282,7 +290,7 @@ func (cc *cronjobcontroller) processCtljobAndAcvJob(cronJob *batchv1.CronJob, Jo
 	}
 	return updateStatus, nil
 }
-func IsJobFinished(job *batchv1.Job) (bool, batchv1.JobPhase) {
+func isJobFinished(job *batchv1.Job) (bool, batchv1.JobPhase) {
 	if job.Status.State.Phase == batchv1.Completed || job.Status.State.Phase == batchv1.Failed || job.Status.State.Phase == batchv1.Terminated {
 		return true, job.Status.State.Phase
 	}
@@ -349,10 +357,8 @@ func (cc *cronjobcontroller) validateTZandSchedule(cj *batchv1.CronJob, recorder
 		timeZone := ptr.Deref(cj.Spec.TimeZone, "")
 		if _, err := time.LoadLocation(timeZone); err != nil {
 			klog.Errorf("Invalid time zone %q in CronJob %s: %v", timeZone, klog.KObj(cj), err)
-			if recorder != nil {
-				recorder.Eventf(cj, corev1.EventTypeWarning, "InvalidTimeZone",
-					"Invalid time zone %q: %v", timeZone, err)
-			}
+			recorder.Eventf(cj, corev1.EventTypeWarning, "InvalidTimeZone",
+				"Invalid time zone %q: %v", timeZone, err)
 			return nil, err
 		}
 	}
@@ -391,8 +397,8 @@ func (cc *cronjobcontroller) processConcurrencyPolicy(cj *batchv1.CronJob) (bool
 	}
 	return false, false, nil
 }
+
 func (cc *cronjobcontroller) createJob(cronJob *batchv1.CronJob, scheduledTime time.Time) (*batchv1.Job, error) {
-	//TODO 检查这些情况对应的处理是否正确
 	jobTemplate, err := getJobFromTemplate(cronJob, scheduledTime)
 	if err != nil {
 		klog.Errorf("Failed to get job from template for cronjob %s: %v", klog.KObj(cronJob), err)
@@ -405,8 +411,8 @@ func (cc *cronjobcontroller) createJob(cronJob *batchv1.CronJob, scheduledTime t
 		klog.V(2).Infof("Namespace %s is terminating, skipping job creation for CronJob %s", cronJob.Namespace, klog.KObj(cronJob))
 		cc.recorder.Eventf(cronJob, corev1.EventTypeWarning, "NamespaceTerminating", "Namespace %s is terminating, skipping job creation", cronJob.Namespace)
 		return nil, err
-	case errors.IsAlreadyExists(err):
 
+	case errors.IsAlreadyExists(err):
 		existingJob, err := getJobApi(cc.vcClient, job.Namespace, job.Name)
 		if err != nil {
 			if errors.IsNotFound(err) {
@@ -415,15 +421,13 @@ func (cc *cronjobcontroller) createJob(cronJob *batchv1.CronJob, scheduledTime t
 			}
 			return nil, fmt.Errorf("failed to fetch conflicting job: %w", err)
 		}
-
 		if !metav1.IsControlledBy(existingJob, cronJob) {
 			cc.recorder.Eventf(cronJob, corev1.EventTypeWarning, "ForeignJob",
 				"Job %s exists but not owned by this CronJob (current owner: %s)",
 				existingJob.Name, metav1.GetControllerOf(existingJob).Name)
 			return nil, nil
 		}
-
-		if isFinished, _ := IsJobFinished(existingJob); isFinished {
+		if isFinished, _ := isJobFinished(existingJob); isFinished {
 			klog.V(2).Infof("Found finished duplicate job %s", klog.KObj(existingJob))
 			return nil, nil
 		}
@@ -435,6 +439,7 @@ func (cc *cronjobcontroller) createJob(cronJob *batchv1.CronJob, scheduledTime t
 		cc.recorder.Eventf(cronJob, corev1.EventTypeWarning, "FailedCreate", "Failed to create job: %v", err)
 		return nil, err
 	}
+
 	if !metav1.IsControlledBy(job, cronJob) {
 		cleanupErr := deleteJobApi(cc.vcClient, job.Namespace, job.Name)
 		if cleanupErr != nil {
