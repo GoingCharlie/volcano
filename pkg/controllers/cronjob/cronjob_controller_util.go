@@ -15,7 +15,6 @@ import (
 	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
 	batchv1 "volcano.sh/apis/pkg/apis/batch/v1alpha1"
-	vcclientset "volcano.sh/apis/pkg/client/clientset/versioned"
 	"volcano.sh/volcano/pkg/features"
 )
 
@@ -46,12 +45,10 @@ func (e missedSchedulesType) String() string {
 func formatSchedule(cj *batchv1.CronJob, recorder record.EventRecorder) string {
 	if strings.Contains(cj.Spec.Schedule, "TZ") {
 		if recorder != nil {
-			recorder.Eventf(cj, corev1.EventTypeWarning, "UnsupportedSchedule", "CRON_TZ or TZ used in schedule %q is not officially supported, see https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/ for more details", cj.Spec.Schedule)
+			recorder.Eventf(cj, corev1.EventTypeWarning, "UnsupportedSchedule", "CRON_TZ or TZ in the schedule %q is not officially supported. If set, the TimeZone field will be ignored during execution.", cj.Spec.Schedule)
 		}
-
 		return cj.Spec.Schedule
 	}
-
 	if cj.Spec.TimeZone != nil {
 		if _, err := time.LoadLocation(*cj.Spec.TimeZone); err != nil {
 			return cj.Spec.Schedule
@@ -59,7 +56,6 @@ func formatSchedule(cj *batchv1.CronJob, recorder record.EventRecorder) string {
 
 		return fmt.Sprintf("TZ=%s %s", *cj.Spec.TimeZone, cj.Spec.Schedule)
 	}
-
 	return cj.Spec.Schedule
 }
 
@@ -83,8 +79,9 @@ func mostRecentScheduleTime(cj *batchv1.CronJob, now time.Time, schedule cron.Sc
 			earliestTime = schedulingDeadline
 		}
 	}
-
+	fmt.Printf("%+v\n", now)
 	t1 := schedule.Next(earliestTime)
+	fmt.Printf("%+v\n", t1)
 	t2 := schedule.Next(t1)
 
 	if now.Before(t1) {
@@ -273,12 +270,12 @@ func getTimeHashInMinutes(scheduledTime time.Time) int64 {
 	return scheduledTime.Unix() / 60
 }
 
-type byJobStartTime []*batchv1.Job
+type byJobCreationTimestamp []*batchv1.Job
 
-func (o byJobStartTime) Len() int      { return len(o) }
-func (o byJobStartTime) Swap(i, j int) { o[i], o[j] = o[j], o[i] }
+func (o byJobCreationTimestamp) Len() int      { return len(o) }
+func (o byJobCreationTimestamp) Swap(i, j int) { o[i], o[j] = o[j], o[i] }
 
-func (o byJobStartTime) Less(i, j int) bool {
+func (o byJobCreationTimestamp) Less(i, j int) bool {
 	if o[i].ObjectMeta.CreationTimestamp.IsZero() && !o[j].ObjectMeta.CreationTimestamp.IsZero() {
 		return false
 	}
@@ -310,22 +307,4 @@ func deleteFromActiveList(cc *batchv1.CronJob, uid types.UID) {
 	if newLen < originalLen {
 		cc.Status.Active = active[:newLen:newLen]
 	}
-}
-
-func deleteJob(vcClient vcclientset.Interface, cj *batchv1.CronJob, job *batchv1.Job, recorder record.EventRecorder) bool {
-	if vcClient == nil || job == nil || cj == nil {
-		return false
-	}
-	err := deleteJobApi(vcClient, job.Namespace, job.Name)
-
-	if err != nil {
-		recorder.Eventf(cj, corev1.EventTypeWarning, "FailedDelete", "Deleted job: %v", err)
-		klog.Error(err, "Error deleting job from cronjob", "job", klog.KObj(job), "cronjob", klog.KObj(cj))
-		return false
-	}
-
-	deleteFromActiveList(cj, job.ObjectMeta.UID)
-	recorder.Eventf(cj, corev1.EventTypeNormal, "SuccessfulDelete", "Deleted job %v", job.Name)
-
-	return true
 }
