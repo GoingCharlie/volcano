@@ -40,6 +40,8 @@ type cronjobcontroller struct {
 	kubeClient kubernetes.Interface
 	vcClient   vcclientset.Interface
 
+	cronjobClient   cronjobClientInterface
+	jobClient       jobClientInterface
 	jobInformer     batchinformer.JobInformer
 	cronJobInformer batchinformer.CronJobInformer
 
@@ -64,6 +66,8 @@ func (cc *cronjobcontroller) Initialize(opt *framework.ControllerOption) error {
 	// vcscheme.AddToScheme(runtime.NewScheme())
 	cc.kubeClient = opt.KubeClient
 	cc.vcClient = opt.VolcanoClient
+	cc.cronjobClient = &realCronjobClient{}
+	cc.jobClient = &realJobClient{}
 	workers := opt.WorkerNum
 	// Initialize event client
 	eventBroadcaster := record.NewBroadcaster()
@@ -236,7 +240,7 @@ func (cc *cronjobcontroller) syncCronJob(cronJob *batchv1.CronJob, jobsByCronJob
 	}
 	// If there is no unmet start times, we skip job creation.
 	if scheduledTime == nil {
-		print("scheduleTime is nil")
+		print("scheduleTime is nil\n")
 		klog.V(2).Info("No unmet start times, skipping job creation",
 			"cronjob", klog.KObj(cronJob))
 		t := nextScheduleTimeDuration(cronJob, now, sch)
@@ -244,17 +248,18 @@ func (cc *cronjobcontroller) syncCronJob(cronJob *batchv1.CronJob, jobsByCronJob
 	}
 
 	// If the cronjob has a starting deadline, check if the scheduled time is after the deadline.
-	if cronJob.Spec.StartingDeadlineSeconds != nil {
-		if now.After(scheduledTime.Add(time.Duration(*cronJob.Spec.StartingDeadlineSeconds) * time.Second)) {
-			klog.V(2).Info("Missed job creation because the starting deadline has passed",
-				"cronjob", klog.KObj(cronJob), "scheduledTime", scheduledTime)
-			cc.recorder.Eventf(cronJob, v1.EventTypeWarning, "StartingDeadlineExceeded", "Missed job creation because the starting deadline has passed: %v", *cronJob.Spec.StartingDeadlineSeconds)
-			t := nextScheduleTimeDuration(cronJob, now, sch)
-			return t, updateStatus, nil
-		}
-	}
+	// if cronJob.Spec.StartingDeadlineSeconds != nil {
+	// 	if now.After(scheduledTime.Add(time.Duration(*cronJob.Spec.StartingDeadlineSeconds) * time.Second)) {
+	// 		klog.V(2).Info("Missed job creation because the starting deadline has passed",
+	// 			"cronjob", klog.KObj(cronJob), "scheduledTime", scheduledTime)
+	// 		cc.recorder.Eventf(cronJob, v1.EventTypeWarning, "StartingDeadlineExceeded", "Missed job creation because the starting deadline has passed: %v", *cronJob.Spec.StartingDeadlineSeconds)
+	// 		t := nextScheduleTimeDuration(cronJob, now, sch)
+	// 		return t, updateStatus, nil
+	// 	}
+	// }
 
 	// check if the scheduled time is already processed.
+	print("already process\n")
 	if inActiveListByName(cronJob, &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      getJobName(cronJob, *scheduledTime),
@@ -301,6 +306,7 @@ func (cc *cronjobcontroller) syncCronJob(cronJob *batchv1.CronJob, jobsByCronJob
 	}
 	cronJob.Status.Active = append(cronJob.Status.Active, convertToVolcanoJobRef(jobRef))
 	cronJob.Status.LastScheduleTime = &metav1.Time{Time: *scheduledTime}
+	print("cronJob.Status.LastScheduleTime: ", cronJob.Status.LastScheduleTime, "\n")
 	updateStatus = true
 
 	t := nextScheduleTimeDuration(cronJob, now, sch)

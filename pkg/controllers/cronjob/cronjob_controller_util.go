@@ -79,9 +79,10 @@ func mostRecentScheduleTime(cj *batchv1.CronJob, now time.Time, schedule cron.Sc
 			earliestTime = schedulingDeadline
 		}
 	}
-	fmt.Printf("%+v\n", now)
+	fmt.Printf("earliestTime %+v\n", earliestTime)
+	fmt.Printf("now %+v\n", now)
 	t1 := schedule.Next(earliestTime)
-	fmt.Printf("%+v\n", t1)
+	fmt.Printf("t1 %+v\n", t1)
 	t2 := schedule.Next(t1)
 
 	if now.Before(t1) {

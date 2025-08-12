@@ -109,6 +109,7 @@ func (cc *cronjobcontroller) updateCronJob(oldObj interface{}, newObj interface{
 	}
 	// No need to update if ResourceVersion is not changed
 	if newCronjob.ResourceVersion == oldCronjob.ResourceVersion {
+		print("ResourceVersion equal \n")
 		klog.V(6).Infof("No need to update because cronjob is not modified.")
 		return
 	}
@@ -240,10 +241,13 @@ func (cc *cronjobcontroller) processCtljobAndActiveJob(cronJob *batchv1.CronJob,
 
 	for _, job := range jobsByCronJob {
 		ctrlJobs[job.UID] = true
+		print("uid: ", job.ObjectMeta.UID, "\n")
+		activeJobs := cronJob.Status.Active
+		print("inactivelist ", len(activeJobs), "\n")
 		found := inActiveList(cronJob, job.ObjectMeta.UID)
 		isFinish, _ := isJobFinished(job)
 		if !found && !isFinish {
-			cjCopy, err := getCronJobClient(cc.vcClient, cronJob.Namespace, cronJob.Name)
+			cjCopy, err := cc.cronjobClient.getCronJobClient(cc.vcClient, cronJob.Namespace, cronJob.Name)
 			if err != nil {
 				return updateStatus, err
 			}
@@ -308,31 +312,31 @@ func (cc *cronjobcontroller) removeOldestJobs(cj *batchv1.CronJob, js []*batchv1
 
 	for i := 0; i < numToDelete; i++ {
 		klog.V(4).Info("Removing job from CronJob list", "job", js[i].Name, "cronjob", klog.KObj(cj))
-		if deleteJobByClient(cc.vcClient, cj, js[i], cc.recorder) {
+		if deleteJobByClient(cc.vcClient, cc.jobClient, cj, js[i], cc.recorder) {
 			updateStatus = true
 		}
 	}
 	return updateStatus
 }
 
-// deleteJobByApi attempts to delete a Job through the API server and updates the CronJob's status.
+// deleteJobByClient attempts to delete a Job through the API server and updates the CronJob's status.
 // Returns true if deletion was successful, false otherwise.
-func deleteJobByClient(vcClient vcclientset.Interface, cc *batchv1.CronJob, job *batchv1.Job, recorder record.EventRecorder) bool {
+func deleteJobByClient(vcClient vcclientset.Interface, jobClient jobClientInterface, cc *batchv1.CronJob, job *batchv1.Job, recorder record.EventRecorder) bool {
 	const (
 		deleteSuccessEvent = "SuccessfulDelete"
 		deleteFailureEvent = "FailedDelete"
 	)
 
 	if vcClient == nil || cc == nil || job == nil {
-		klog.ErrorS(nil, "Invalid arguments provided to deleteJobByApi",
+		klog.ErrorS(nil, "Invalid arguments provided to deleteJob",
 			"clientNil", vcClient == nil,
 			"cronjobNil", cc == nil,
 			"jobNil", job == nil)
 		return false
 	}
 
-	// Execute API deletion
-	err := deleteJobClient(vcClient, job.Namespace, job.Name)
+	// Execute Clinet deletion
+	err := jobClient.deleteJobClient(vcClient, job.Namespace, job.Name)
 	if err != nil {
 
 		klog.ErrorS(err, "Failed to delete Job",
@@ -345,6 +349,7 @@ func deleteJobByClient(vcClient vcclientset.Interface, cc *batchv1.CronJob, job 
 	}
 
 	// Cleanup local state after successful API deletion
+	print("lenlenlen ", len(cc.Status.Active), " UID ", job.ObjectMeta.UID, "\n")
 	deleteFromActiveList(cc, job.ObjectMeta.UID)
 	recorder.Eventf(cc, corev1.EventTypeNormal, deleteSuccessEvent,
 		"Deleted job %q", job.Name)
@@ -384,12 +389,12 @@ func (cc *cronjobcontroller) processConcurrencyPolicy(cj *batchv1.CronJob) (bool
 				"Replacing active job for CronJob")
 			for _, activeJob := range cj.Status.Active {
 				klog.V(4).Info("Deleting job that was still running at next scheduled start time", "job", klog.KRef(activeJob.Namespace, activeJob.Name))
-				job, err := getJobClient(cc.vcClient, activeJob.Namespace, activeJob.Name)
+				job, err := cc.jobClient.getJobClient(cc.vcClient, activeJob.Namespace, activeJob.Name)
 				if err != nil {
 					cc.recorder.Eventf(cj, corev1.EventTypeWarning, "FailedGet", "Get job: %v", err)
 					return false, updateStatus, err
 				}
-				if !deleteJobByClient(cc.vcClient, cj, job, cc.recorder) {
+				if !deleteJobByClient(cc.vcClient, cc.jobClient, cj, job, cc.recorder) {
 					return false, updateStatus, fmt.Errorf("could not replace job %s/%s", job.Namespace, job.Name)
 				}
 				updateStatus = true
@@ -406,26 +411,34 @@ func (cc *cronjobcontroller) createJob(cronJob *batchv1.CronJob, scheduledTime t
 		cc.recorder.Eventf(cronJob, corev1.EventTypeWarning, "FailedCreate", "Failed to create job from template: %v", err)
 		return nil, err
 	}
-	job, err := createJobClient(cc.vcClient, cronJob.Namespace, jobTemplate)
+	job, err := cc.jobClient.createJobClient(cc.vcClient, cronJob.Namespace, jobTemplate)
 	switch {
 	case errors.HasStatusCause(err, corev1.NamespaceTerminatingCause):
+		print("namespace ter \n")
 		klog.V(2).Infof("Namespace %s is terminating, skipping job creation for CronJob %s", cronJob.Namespace, klog.KObj(cronJob))
 		cc.recorder.Eventf(cronJob, corev1.EventTypeWarning, "NamespaceTerminating", "Namespace %s is terminating, skipping job creation", cronJob.Namespace)
 		return nil, err
 
 	case errors.IsAlreadyExists(err):
-		existingJob, err := getJobClient(cc.vcClient, job.Namespace, job.Name)
+		print("IsAlreadyExists \n")
+		existingJob, err := cc.jobClient.getJobClient(cc.vcClient, jobTemplate.Namespace, jobTemplate.Name)
 		if err != nil {
 			if errors.IsNotFound(err) {
-				klog.Warningf("Job %s disappeared after creation conflict, retrying", job.Name)
+				klog.Warningf("Job %s disappeared after creation conflict, retrying", jobTemplate.Name)
 				return nil, err
 			}
 			return nil, fmt.Errorf("failed to fetch conflicting job: %w", err)
 		}
+		// fmt.Printf("existingJob: %+v\n", *existingJob)
 		if !metav1.IsControlledBy(existingJob, cronJob) {
+			ownerRef := metav1.GetControllerOf(existingJob)
+			ownerName := "none"
+			if ownerRef != nil {
+				ownerName = ownerRef.Name
+			}
 			cc.recorder.Eventf(cronJob, corev1.EventTypeWarning, "ForeignJob",
-				"Job %s exists but not owned by this CronJob (current owner: %s)",
-				existingJob.Name, metav1.GetControllerOf(existingJob).Name)
+				"Job %s exists but is not owned by this CronJob (current owner: %s)",
+				existingJob.Name, ownerName)
 			return nil, nil
 		}
 		if isFinished, _ := isJobFinished(existingJob); isFinished {
@@ -436,13 +449,14 @@ func (cc *cronjobcontroller) createJob(cronJob *batchv1.CronJob, scheduledTime t
 		klog.V(2).Infof("Job %s already exists and is managed by this CronJob", klog.KObj(existingJob))
 		return existingJob, nil
 	case err != nil:
+		print("err != nil \n")
 		klog.Errorf("Failed to create job for CronJob %s: %v", klog.KObj(cronJob), err)
 		cc.recorder.Eventf(cronJob, corev1.EventTypeWarning, "FailedCreate", "Failed to create job: %v", err)
 		return nil, err
 	}
 
 	if !metav1.IsControlledBy(job, cronJob) {
-		cleanupErr := deleteJobClient(cc.vcClient, job.Namespace, job.Name)
+		cleanupErr := cc.jobClient.deleteJobClient(cc.vcClient, job.Namespace, job.Name)
 		if cleanupErr != nil {
 			klog.Errorf("Failed to cleanup orphaned job %s: %v", klog.KObj(job), cleanupErr)
 		}
