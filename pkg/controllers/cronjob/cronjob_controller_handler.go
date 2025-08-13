@@ -67,7 +67,6 @@ func (cc *cronjobcontroller) updateJob(oldObj, newObj interface{}) {
 func (cc *cronjobcontroller) deleteJob(obj interface{}) {
 	job, ok := obj.(*batchv1.Job)
 	if !ok {
-		// If we reached here it means the job was deleted but its final state is unrecorded.
 		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
 		if !ok {
 			klog.Errorf("Couldn't get object from tombstone %#v", obj)
@@ -107,7 +106,6 @@ func (cc *cronjobcontroller) updateCronJob(oldObj interface{}, newObj interface{
 		klog.Errorf("Failed to convert %v to batchv1.CronJob", newObj)
 		return
 	}
-	// No need to update if ResourceVersion is not changed
 	if newCronjob.ResourceVersion == oldCronjob.ResourceVersion {
 		print("ResourceVersion equal \n")
 		klog.V(6).Infof("No need to update because cronjob is not modified.")
@@ -115,11 +113,8 @@ func (cc *cronjobcontroller) updateCronJob(oldObj interface{}, newObj interface{
 	}
 
 	if oldCronjob.Spec.Schedule != newCronjob.Spec.Schedule || !ptr.Equal(oldCronjob.Spec.TimeZone, newCronjob.Spec.TimeZone) {
-		// schedule changed, change the requeue time, pass nil recorder so that syncCronJob will output any warnings
 		sched, err := cron.ParseStandard(formatSchedule(newCronjob, nil))
 		if err != nil {
-			// this is likely a user error in defining the spec value
-			// we should log the error and not reconcile this cronjob until an update to spec
 			klog.V(2).Info("Unparseable schedule for cronjob", "cronjob", klog.KObj(newCronjob), "schedule", newCronjob.Spec.Schedule, "err", err)
 			cc.recorder.Eventf(newCronjob, corev1.EventTypeWarning, "UnParseableCronJobSchedule", "unparseable schedule for cronjob: %s", newCronjob.Spec.Schedule)
 			return
@@ -470,14 +465,4 @@ func (cc *cronjobcontroller) createJob(cronJob *batchv1.CronJob, scheduledTime t
 }
 func getRef(object runtime.Object) (*corev1.ObjectReference, error) {
 	return ref.GetReference(scheme.Scheme, object)
-}
-func convertToVolcanoJobRef(k8sRef *corev1.ObjectReference) batchv1.JobReference {
-	return batchv1.JobReference{
-		Kind:            k8sRef.Kind,
-		Namespace:       k8sRef.Namespace,
-		Name:            k8sRef.Name,
-		UID:             k8sRef.UID,
-		APIVersion:      k8sRef.APIVersion,
-		ResourceVersion: k8sRef.ResourceVersion,
-	}
 }

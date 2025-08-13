@@ -4,8 +4,8 @@ github.com/AdaLogics/go-fuzz-headers v0.0.0-20240806141605-e8a1dd7889d6 h1:He8af
 github.com/AdaLogics/go-fuzz-headers v0.0.0-20240806141605-e8a1dd7889d6/go.mod h1:8o94RPi1/7XTJvwPpRSzSUedZrtlirdB3r9Z20bi2f8=
 github.com/Azure/go-ansiterm v0.0.0-20230124172434-306776ec8161 h1:L/gRVlceqvL25UVaW/CKtUDjefjrs0SPonmDGUVOYP0=
 github.com/Azure/go-ansiterm v0.0.0-20230124172434-306776ec8161/go.mod h1:xomTg63KZ2rFqZQzSB4Vz2SUXa1BpHTVz9L5PTmPC4E=
-github.com/GoingCharlie/apis v0.0.0-20250807025046-ba45b47a7a51 h1:JnyWTNz5Z7gJ4fpf2PHMQxAVq3hKiQSXvrsuFY2gk5s=
-github.com/GoingCharlie/apis v0.0.0-20250807025046-ba45b47a7a51/go.mod h1:kGpNdIPbPAN1e6DMFFbcYNLiYhJ8yD5apf0PpKjfs88=
+github.com/GoingCharlie/apis v0.0.0-20250813071243-85ec116a4b17 h1:htQNY+w0JbDwck/RGJBY4cWfAzlLtcgxbJzX4GEtrNs=
+github.com/GoingCharlie/apis v0.0.0-20250813071243-85ec116a4b17/go.mod h1:kGpNdIPbPAN1e6DMFFbcYNLiYhJ8yD5apf0PpKjfs88=
 github.com/JeffAshton/win_pdh v0.0.0-20161109143554-76bb4ee9f0ab h1:UKkYhof1njT1/xq4SEg5z+VpTgjmNeHwPGRQl7takDI=
 github.com/JeffAshton/win_pdh v0.0.0-20161109143554-76bb4ee9f0ab/go.mod h1:3VYc5hodBMJ5+l/7J4xAyMeuM2PNuepvHlGs8yilUCA=
 github.com/MakeNowJust/heredoc v1.0.0 h1:cXCdzVdstXyiTqTvfqk9SDHpKNjxuom+DOlyEeQ4pzQ=

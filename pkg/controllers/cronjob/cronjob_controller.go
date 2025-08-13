@@ -304,7 +304,7 @@ func (cc *cronjobcontroller) syncCronJob(cronJob *batchv1.CronJob, jobsByCronJob
 		klog.V(2).Info("Unable to make object reference", "cronjob", klog.KObj(cronJob), "err", err)
 		return nil, updateStatus, fmt.Errorf("unable to make object reference for job for %s", klog.KObj(cronJob))
 	}
-	cronJob.Status.Active = append(cronJob.Status.Active, convertToVolcanoJobRef(jobRef))
+	cronJob.Status.Active = append(cronJob.Status.Active, *jobRef)
 	cronJob.Status.LastScheduleTime = &metav1.Time{Time: *scheduledTime}
 	print("cronJob.Status.LastScheduleTime: ", cronJob.Status.LastScheduleTime, "\n")
 	updateStatus = true

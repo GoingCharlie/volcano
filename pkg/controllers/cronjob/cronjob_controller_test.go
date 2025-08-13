@@ -120,7 +120,7 @@ func getEventsFromRecorder(recorder *record.FakeRecorder) []string {
 	}
 	return events
 }
-func TestSyncCronJobtemp(t *testing.T) {
+func TestSyncCronJob(t *testing.T) {
 	testCases := []struct {
 		name             string
 		now              time.Time
@@ -1912,7 +1912,7 @@ func setupCronJobStatus(cronJob *batchv1.CronJob, lastScheduleTime *metav1.Time,
 			if err != nil {
 				continue
 			}
-			cronJob.Status.Active = append(cronJob.Status.Active, convertToVolcanoJobRef(ref))
+			cronJob.Status.Active = append(cronJob.Status.Active, *ref)
 		}
 	}
 }
