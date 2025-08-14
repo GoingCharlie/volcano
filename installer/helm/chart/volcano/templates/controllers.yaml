@@ -33,6 +33,7 @@ rules:
     verbs: ["create", "get", "list", "watch", "update", "delete"]
   - apiGroups: ["batch.volcano.sh"]
     resources: ["jobs/status", "jobs/finalizers"]
+    verbs: ["update", "patch"]
   - apiGroups: ["batch.volcano.sh"]
     resources: ["cronjobs"]
     verbs: ["create", "get", "list", "watch", "update", "delete"]
