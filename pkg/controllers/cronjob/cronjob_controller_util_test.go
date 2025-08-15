@@ -16,6 +16,7 @@ limitations under the License.
 package cronjob
 
 import (
+	"fmt"
 	"reflect"
 	"sort"
 	"strings"
@@ -29,11 +30,73 @@ import (
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/tools/record"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/utils/pointer"
 	"k8s.io/utils/ptr"
 	batchv1 "volcano.sh/apis/pkg/apis/batch/v1alpha1"
+	busv1 "volcano.sh/apis/pkg/apis/bus/v1alpha1"
 	"volcano.sh/volcano/pkg/features"
 )
 
+func createVolcanoCronJob() batchv1.CronJob {
+	return batchv1.CronJob{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "batch.volcano.sh/batchv1",
+			Kind:       "CronJob",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "mycronjob-", // 使用YAML中的名称
+			Namespace: "snazzycats",
+			UID:       types.UID("1a2b3c"),
+		},
+		Spec: batchv1.CronJobSpec{
+			Schedule:                "*/5 * * * *",            // 每5分钟运行
+			ConcurrencyPolicy:       batchv1.ForbidConcurrent, // 禁止并发
+			StartingDeadlineSeconds: pointer.Int64(60),        // 60秒启动宽限期
+			JobTemplate: batchv1.JobTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"a": "b"},
+				},
+				Spec: batchv1.JobSpec{
+					SchedulerName: "volcano", // Volcano调度器
+					Plugins: map[string][]string{ // Volcano插件
+						"ssh": {},
+						"env": {},
+						"svc": {},
+					},
+					Tasks: []batchv1.TaskSpec{
+						{
+							Name:     "task-1", // 使用YAML中的任务名
+							Replicas: 1,        // 副本数改为1
+							Template: v1.PodTemplateSpec{
+								ObjectMeta: metav1.ObjectMeta{
+									Name:      "pods",
+									Namespace: "snazzycats",
+								},
+								Spec: v1.PodSpec{
+									Containers: []v1.Container{
+										{
+											Name:    "busybox-container", // 使用YAML中的容器名
+											Image:   "busybox:latest",
+											Command: []string{"/bin/sh", "-c", "date; echo Hello from Volcano CronJob"},
+										},
+									},
+									RestartPolicy: v1.RestartPolicyOnFailure, // 失败重启策略
+								},
+							},
+						},
+					},
+					Policies: []batchv1.LifecyclePolicy{
+						{
+							Event:  busv1.PodEvictedEvent,  // Pod被驱逐时
+							Action: busv1.RestartJobAction, // 重启Job
+						},
+					},
+					MinAvailable: 1, // 最小可用副本数
+				},
+			},
+		},
+	}
+}
 func TestGetJobFromTemplate(t *testing.T) {
 	// getJobFromTemplate2() needs to take the job template and copy the labels and annotations
 	// and other fields, and add a created-by reference.
@@ -47,44 +110,7 @@ func TestGetJobFromTemplate(t *testing.T) {
 
 	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.VolcanoCronJobSupport, true)
 
-	cj := batchv1.CronJob{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "mycronjob",
-			Namespace: "snazzycats",
-			UID:       types.UID("1a2b3c"),
-		},
-		Spec: batchv1.CronJobSpec{
-			Schedule:          "* * * * ?",
-			ConcurrencyPolicy: batchv1.AllowConcurrent,
-			JobTemplate: batchv1.JobTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					CreationTimestamp: metav1.Time{Time: scheduledTime},
-					Labels:            map[string]string{"a": "b"},
-				},
-				Spec: batchv1.JobSpec{
-					Tasks: []batchv1.TaskSpec{
-						{
-							Name:     "task1",
-							Replicas: 6,
-							Template: v1.PodTemplateSpec{
-								ObjectMeta: metav1.ObjectMeta{
-									Name:      "pods",
-									Namespace: "snazzycats",
-								},
-								Spec: v1.PodSpec{
-									Containers: []v1.Container{
-										{
-											Name: "Containers",
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
+	cj := createVolcanoCronJob()
 
 	testCases := []struct {
 		name                        string
@@ -130,6 +156,7 @@ func TestGetJobFromTemplate(t *testing.T) {
 
 			var job *batchv1.Job
 			job, err := getJobFromTemplate(&cj, scheduledTime)
+			fmt.Printf("Job details: %+v\n", job) // 带字段名输出
 			if err != nil {
 				t.Errorf("Did not expect error: %s", err)
 			}

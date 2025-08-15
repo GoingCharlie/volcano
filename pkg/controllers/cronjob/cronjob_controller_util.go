@@ -252,14 +252,13 @@ func getJobFromTemplate(cj *batchv1.CronJob, scheduledTime time.Time) (*batchv1.
 		// Append job creation timestamp to the cronJob annotations. The time will be in RFC3339 form.
 		annotations[batchv1.CronJobScheduledTimestampAnnotation] = scheduledTime.In(timeZoneLocation).Format(time.RFC3339)
 	}
-
+	print("it works!\n")
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Labels:            labels,
-			Annotations:       annotations,
-			Name:              name,
-			CreationTimestamp: metav1.Time{Time: scheduledTime},
-			OwnerReferences:   []metav1.OwnerReference{*metav1.NewControllerRef(cj, controllerKind)},
+			Labels:          labels,
+			Annotations:     annotations,
+			Name:            name,
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(cj, controllerKind)},
 		},
 	}
 	cj.Spec.JobTemplate.Spec.DeepCopyInto(&job.Spec)

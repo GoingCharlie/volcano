@@ -43,7 +43,7 @@ var service = &router.AdmissionService{
 			Name: "validatecronjob.volcano.sh",
 			Rules: []whv1.RuleWithOperations{
 				{
-					Operations: []whv1.OperationType{whv1.Create},
+					Operations: []whv1.OperationType{whv1.Create, whv1.Update},
 					Rule: whv1.Rule{
 						APIGroups:   []string{"batch.volcano.sh"},
 						APIVersions: []string{"v1alpha1"},

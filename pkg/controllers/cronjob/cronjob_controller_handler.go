@@ -18,10 +18,10 @@ import (
 	ref "k8s.io/client-go/tools/reference"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
-	"k8s.io/kubectl/pkg/scheme"
 	"k8s.io/utils/ptr"
 	batchv1 "volcano.sh/apis/pkg/apis/batch/v1alpha1"
 	vcclientset "volcano.sh/apis/pkg/client/clientset/versioned"
+	"volcano.sh/apis/pkg/client/clientset/versioned/scheme"
 )
 
 func (cc *cronjobcontroller) addJob(obj interface{}) {
