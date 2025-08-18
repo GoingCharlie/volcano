@@ -25,7 +25,7 @@ import (
 )
 
 func (cc *cronjobcontroller) addJob(obj interface{}) {
-	print("add Job\n")
+	//print("add Job\n")
 	job, ok := obj.(*batchv1.Job)
 	if !ok {
 		klog.Errorf("obj is not Job")
@@ -42,7 +42,7 @@ func (cc *cronjobcontroller) addJob(obj interface{}) {
 	}
 }
 func (cc *cronjobcontroller) updateJob(oldObj, newObj interface{}) {
-	print("updateJob\n")
+	//print("updateJob\n")
 	oldJob, okOld := oldObj.(*batchv1.Job)
 	if !okOld {
 		klog.Errorf("Failed to convert %v to batchv1.Job", oldObj)
@@ -67,7 +67,7 @@ func (cc *cronjobcontroller) updateJob(oldObj, newObj interface{}) {
 	}
 }
 func (cc *cronjobcontroller) deleteJob(obj interface{}) {
-	print("deleteJob\n")
+	//print("deleteJob\n")
 	job, ok := obj.(*batchv1.Job)
 	if !ok {
 		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
@@ -87,7 +87,7 @@ func (cc *cronjobcontroller) deleteJob(obj interface{}) {
 	}
 }
 func (cc *cronjobcontroller) addCronjobcontrollerQueue(obj interface{}, duration time.Duration) {
-	print("addCronjobcontrollerQueue\n")
+	//print("addCronjobcontrollerQueue\n")
 	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
 	if err != nil {
 		klog.Errorf("Failed to get key for object <%v>: %v", obj, err)
@@ -100,7 +100,7 @@ func (cc *cronjobcontroller) addCronjobcontrollerQueue(obj interface{}, duration
 	cc.queue.AddAfter(key, duration)
 }
 func (cc *cronjobcontroller) updateCronJob(oldObj interface{}, newObj interface{}) {
-	print("updateCronJob\n")
+	//print("updateCronJob\n")
 	oldCronjob, okOld := oldObj.(*batchv1.CronJob)
 	if !okOld {
 		klog.Errorf("Failed to convert %v to batchv1.CronJob", oldObj)
@@ -133,7 +133,7 @@ func (cc *cronjobcontroller) updateCronJob(oldObj interface{}, newObj interface{
 	cc.addCronjobcontrollerQueue(newObj, 0)
 }
 func (cc *cronjobcontroller) isControlledBy(job *batchv1.Job) *batchv1.CronJob {
-	print("isControlledBy\n")
+	//print("isControlledBy\n")
 	controllerRef := metav1.GetControllerOf(job)
 	if controllerRef == nil {
 		return nil
@@ -148,7 +148,7 @@ func (cc *cronjobcontroller) isControlledBy(job *batchv1.Job) *batchv1.CronJob {
 	return nil
 }
 func (cc *cronjobcontroller) handleJobError(queue workqueue.TypedRateLimitingInterface[string], key string, err error) {
-	print("handleJobError\n")
+	//print("handleJobError\n")
 	if cc.maxRequeueNum == -1 || queue.NumRequeues(key) < cc.maxRequeueNum {
 		klog.V(2).Infof("Failed to handle CronJob <%s>: %v",
 			key, err)
@@ -160,7 +160,7 @@ func (cc *cronjobcontroller) handleJobError(queue workqueue.TypedRateLimitingInt
 }
 
 func (cc *cronjobcontroller) getJobsByCronJob(cronJob *batchv1.CronJob) ([]*batchv1.Job, error) {
-	print("getJobsByCronJob\n")
+	//print("getJobsByCronJob\n")
 	jobList, err := cc.jobLister.Jobs(cronJob.Namespace).List(labels.Everything())
 	if err != nil {
 		return nil, err
@@ -181,7 +181,7 @@ func (cc *cronjobcontroller) getJobsByCronJob(cronJob *batchv1.CronJob) ([]*batc
 	return jobsByCronJob, nil
 }
 func (cc *cronjobcontroller) processFinishedJobs(cronJob *batchv1.CronJob, jobsByCronJob []*batchv1.Job) bool {
-	print("processFinishedJobs\n")
+	//print("processFinishedJobs\n")
 	updateStatus := false
 	failedJobs := []*batchv1.Job{}
 	successfulJobs := []*batchv1.Job{}
@@ -238,7 +238,7 @@ func (cc *cronjobcontroller) processFinishedJobs(cronJob *batchv1.CronJob, jobsB
 // 1. Identifies and handles orphaned jobs (jobs owned by the CronJob but not in its active list)
 // 2. Cleans up stale references in the CronJob's active list (jobs that no longer exist or have mismatched UIDs)
 func (cc *cronjobcontroller) processCtljobAndActiveJob(cronJob *batchv1.CronJob, jobsByCronJob []*batchv1.Job) (bool, error) {
-	print("processCtljobAndActiveJob\n")
+	//print("processCtljobAndActiveJob\n")
 	updateStatus := false
 	ctrlJobs := make(map[types.UID]bool)
 
@@ -294,23 +294,23 @@ func (cc *cronjobcontroller) processCtljobAndActiveJob(cronJob *batchv1.CronJob,
 	return updateStatus, nil
 }
 func isJobFinished(job *batchv1.Job) (bool, batchv1.JobPhase) {
-	print("isJobFinished\n")
+	//print("isJobFinished\n")
 	if job.Status.State.Phase == batchv1.Completed || job.Status.State.Phase == batchv1.Failed || job.Status.State.Phase == batchv1.Terminated {
 		return true, job.Status.State.Phase
 	}
 	return false, ""
 }
 func (cc *cronjobcontroller) removeOldestJobs(cj *batchv1.CronJob, js []*batchv1.Job, maxJobs int32) bool {
-	print("removeOldestJobs\n")
+	//print("removeOldestJobs\n")
 	updateStatus := false
 	numToDelete := len(js) - int(maxJobs)
 	if numToDelete <= 0 {
 		return updateStatus
 	}
 	klog.V(4).Info("Cleaning up jobs from CronJob list", "deletejobnum", numToDelete, "jobnum", len(js), "cronjob", klog.KObj(cj))
-
+	print("sort\n")
 	sort.Sort(byJobCreationTimestamp(js))
-
+	print("len(js):", len(js), " maxJobs:", int(maxJobs), "\n")
 	for i := 0; i < numToDelete; i++ {
 		klog.V(4).Info("Removing job from CronJob list", "job", js[i].Name, "cronjob", klog.KObj(cj))
 		if deleteJobByClient(cc.vcClient, cc.jobClient, cj, js[i], cc.recorder) {
@@ -323,7 +323,7 @@ func (cc *cronjobcontroller) removeOldestJobs(cj *batchv1.CronJob, js []*batchv1
 // deleteJobByClient attempts to delete a Job through the API server and updates the CronJob's status.
 // Returns true if deletion was successful, false otherwise.
 func deleteJobByClient(vcClient vcclientset.Interface, jobClient jobClientInterface, cc *batchv1.CronJob, job *batchv1.Job, recorder record.EventRecorder) bool {
-	print("deleteJobByClient\n")
+	//print("deleteJobByClient\n")
 	const (
 		deleteSuccessEvent = "SuccessfulDelete"
 		deleteFailureEvent = "FailedDelete"
@@ -358,7 +358,7 @@ func deleteJobByClient(vcClient vcclientset.Interface, jobClient jobClientInterf
 }
 
 func (cc *cronjobcontroller) validateTZandSchedule(cj *batchv1.CronJob, recorder record.EventRecorder) (cron.Schedule, error) {
-	print("validateTZandSchedule\n")
+	//print("validateTZandSchedule\n")
 	if cj.Spec.TimeZone != nil {
 		timeZone := ptr.Deref(cj.Spec.TimeZone, "")
 		if _, err := time.LoadLocation(timeZone); err != nil {
@@ -373,7 +373,7 @@ func (cc *cronjobcontroller) validateTZandSchedule(cj *batchv1.CronJob, recorder
 }
 
 func (cc *cronjobcontroller) processConcurrencyPolicy(cj *batchv1.CronJob) (bool, bool, error) {
-	print("processConcurrencyPolicy\n")
+	//print("processConcurrencyPolicy\n")
 	if cj.Spec.ConcurrencyPolicy == batchv1.ForbidConcurrent {
 		if len(cj.Status.Active) > 0 {
 			klog.V(4).Info("Forbid concurrent jobs for CronJob", "cronjob", klog.KObj(cj))
@@ -397,6 +397,7 @@ func (cc *cronjobcontroller) processConcurrencyPolicy(cj *batchv1.CronJob) (bool
 					cc.recorder.Eventf(cj, corev1.EventTypeWarning, "FailedGet", "Get job: %v", err)
 					return false, updateStatus, err
 				}
+				print("concurrent\n")
 				if !deleteJobByClient(cc.vcClient, cc.jobClient, cj, job, cc.recorder) {
 					return false, updateStatus, fmt.Errorf("could not replace job %s/%s", job.Namespace, job.Name)
 				}
@@ -408,7 +409,7 @@ func (cc *cronjobcontroller) processConcurrencyPolicy(cj *batchv1.CronJob) (bool
 	return false, false, nil
 }
 func (cc *cronjobcontroller) createJob(cronJob *batchv1.CronJob, scheduledTime time.Time) (*batchv1.Job, error) {
-	print("createJob\n")
+	//print("createJob\n")
 	jobTemplate, err := getJobFromTemplate(cronJob, scheduledTime)
 	if err != nil {
 		klog.Errorf("Failed to get job from template for cronjob %s: %v", klog.KObj(cronJob), err)
@@ -469,6 +470,6 @@ func (cc *cronjobcontroller) createJob(cronJob *batchv1.CronJob, scheduledTime t
 	return job, nil
 }
 func getRef(object runtime.Object) (*corev1.ObjectReference, error) {
-	print("getRef\n")
+	//print("getRef\n")
 	return ref.GetReference(scheme.Scheme, object)
 }
