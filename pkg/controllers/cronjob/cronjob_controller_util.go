@@ -79,10 +79,7 @@ func mostRecentScheduleTime(cj *batchv1.CronJob, now time.Time, schedule cron.Sc
 			earliestTime = schedulingDeadline
 		}
 	}
-	fmt.Printf("earliestTime %+v\n", earliestTime)
-	fmt.Printf("now %+v\n", now)
 	t1 := schedule.Next(earliestTime)
-	fmt.Printf("t1 %+v\n", t1)
 	t2 := schedule.Next(t1)
 
 	if now.Before(t1) {
@@ -252,7 +249,6 @@ func getJobFromTemplate(cj *batchv1.CronJob, scheduledTime time.Time) (*batchv1.
 		// Append job creation timestamp to the cronJob annotations. The time will be in RFC3339 form.
 		annotations[batchv1.CronJobScheduledTimestampAnnotation] = scheduledTime.In(timeZoneLocation).Format(time.RFC3339)
 	}
-	print("it works!\n")
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels:          labels,

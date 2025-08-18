@@ -107,7 +107,6 @@ func (cc *cronjobcontroller) updateCronJob(oldObj interface{}, newObj interface{
 		return
 	}
 	if newCronjob.ResourceVersion == oldCronjob.ResourceVersion {
-		print("ResourceVersion equal \n")
 		klog.V(6).Infof("No need to update because cronjob is not modified.")
 		return
 	}
@@ -236,9 +235,6 @@ func (cc *cronjobcontroller) processCtljobAndActiveJob(cronJob *batchv1.CronJob,
 
 	for _, job := range jobsByCronJob {
 		ctrlJobs[job.UID] = true
-		print("uid: ", job.ObjectMeta.UID, "\n")
-		activeJobs := cronJob.Status.Active
-		print("inactivelist ", len(activeJobs), "\n")
 		found := inActiveList(cronJob, job.ObjectMeta.UID)
 		isFinish, _ := isJobFinished(job)
 		if !found && !isFinish {
@@ -344,7 +340,6 @@ func deleteJobByClient(vcClient vcclientset.Interface, jobClient jobClientInterf
 	}
 
 	// Cleanup local state after successful API deletion
-	print("lenlenlen ", len(cc.Status.Active), " UID ", job.ObjectMeta.UID, "\n")
 	deleteFromActiveList(cc, job.ObjectMeta.UID)
 	recorder.Eventf(cc, corev1.EventTypeNormal, deleteSuccessEvent,
 		"Deleted job %q", job.Name)
@@ -409,13 +404,11 @@ func (cc *cronjobcontroller) createJob(cronJob *batchv1.CronJob, scheduledTime t
 	job, err := cc.jobClient.createJobClient(cc.vcClient, cronJob.Namespace, jobTemplate)
 	switch {
 	case errors.HasStatusCause(err, corev1.NamespaceTerminatingCause):
-		print("namespace ter \n")
 		klog.V(2).Infof("Namespace %s is terminating, skipping job creation for CronJob %s", cronJob.Namespace, klog.KObj(cronJob))
 		cc.recorder.Eventf(cronJob, corev1.EventTypeWarning, "NamespaceTerminating", "Namespace %s is terminating, skipping job creation", cronJob.Namespace)
 		return nil, err
 
 	case errors.IsAlreadyExists(err):
-		print("IsAlreadyExists \n")
 		existingJob, err := cc.jobClient.getJobClient(cc.vcClient, jobTemplate.Namespace, jobTemplate.Name)
 		if err != nil {
 			if errors.IsNotFound(err) {
@@ -424,7 +417,6 @@ func (cc *cronjobcontroller) createJob(cronJob *batchv1.CronJob, scheduledTime t
 			}
 			return nil, fmt.Errorf("failed to fetch conflicting job: %w", err)
 		}
-		// fmt.Printf("existingJob: %+v\n", *existingJob)
 		if !metav1.IsControlledBy(existingJob, cronJob) {
 			ownerRef := metav1.GetControllerOf(existingJob)
 			ownerName := "none"
@@ -444,7 +436,6 @@ func (cc *cronjobcontroller) createJob(cronJob *batchv1.CronJob, scheduledTime t
 		klog.V(2).Infof("Job %s already exists and is managed by this CronJob", klog.KObj(existingJob))
 		return existingJob, nil
 	case err != nil:
-		print("err != nil \n")
 		klog.Errorf("Failed to create job for CronJob %s: %v", klog.KObj(cronJob), err)
 		cc.recorder.Eventf(cronJob, corev1.EventTypeWarning, "FailedCreate", "Failed to create job: %v", err)
 		return nil, err

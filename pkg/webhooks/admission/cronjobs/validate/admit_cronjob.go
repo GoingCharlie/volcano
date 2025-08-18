@@ -96,7 +96,11 @@ func validateCronJobCreate(cronjob *v1alpha1.CronJob, reviewResponse *admissionv
 func validateCronJobUpdate(new *v1alpha1.CronJob) error {
 	msg := validateCronjobSpec(&new.Spec, new.Namespace)
 	msg += validateCronJobName(new.Name)
-	return errors.New(msg)
+
+	if msg != "" {
+		return errors.New(msg)
+	}
+	return nil
 }
 func validateCronjobSpec(spec *v1alpha1.CronJobSpec, nameSpace string) string {
 	var msg string

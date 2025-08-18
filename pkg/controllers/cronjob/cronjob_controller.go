@@ -204,11 +204,9 @@ func (cc *cronjobcontroller) syncCronJob(cronJob *batchv1.CronJob, jobsByCronJob
 	now := cc.now()
 
 	// process the finished jobs: delete old jobs, update status, etc.
-	print("processFinishedJobs\n")
 	statusAfterProcessFi := cc.processFinishedJobs(cronJob, jobsByCronJob)
 
 	// process the controller jobs and active jobs
-	print("processCtljobAndActiveJob\n")
 	statusAfterProcessJobs, err := cc.processCtljobAndActiveJob(cronJob, jobsByCronJob)
 
 	updateStatus = statusAfterProcessFi || statusAfterProcessJobs
@@ -223,7 +221,6 @@ func (cc *cronjobcontroller) syncCronJob(cronJob *batchv1.CronJob, jobsByCronJob
 	}
 
 	// check TZ and schedule validity, if valid, get format scheduled time
-	print("validateTZandSchedule\n")
 	sch, validErr := cc.validateTZandSchedule(cronJob, cc.recorder)
 	if validErr != nil {
 		klog.V(2).Info("Error validating cronjob schedule", "cronjob", klog.KObj(cronJob), "err", validErr)
@@ -232,7 +229,6 @@ func (cc *cronjobcontroller) syncCronJob(cronJob *batchv1.CronJob, jobsByCronJob
 
 	// scheduleTime is the next time to run the job. if it is nil, it means there are no unmet start times.
 	scheduledTime, err := nextScheduleTime(cronJob, now, sch, cc.recorder)
-	print(scheduledTime, "\n")
 	if err != nil {
 		klog.V(2).Info("Error getting schedule time", "cronjob", klog.KObj(cronJob), "err", err)
 		cc.recorder.Eventf(cronJob, v1.EventTypeWarning, "InvalidSchedule", "Error getting schedule time: %v", err)
@@ -240,7 +236,6 @@ func (cc *cronjobcontroller) syncCronJob(cronJob *batchv1.CronJob, jobsByCronJob
 	}
 	// If there is no unmet start times, we skip job creation.
 	if scheduledTime == nil {
-		print("scheduleTime is nil\n")
 		klog.V(2).Info("No unmet start times, skipping job creation",
 			"cronjob", klog.KObj(cronJob))
 		t := nextScheduleTimeDuration(cronJob, now, sch)
@@ -259,7 +254,6 @@ func (cc *cronjobcontroller) syncCronJob(cronJob *batchv1.CronJob, jobsByCronJob
 	// }
 
 	// check if the scheduled time is already processed.
-	print("already process\n")
 	if inActiveListByName(cronJob, &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      getJobName(cronJob, *scheduledTime),
@@ -272,9 +266,7 @@ func (cc *cronjobcontroller) syncCronJob(cronJob *batchv1.CronJob, jobsByCronJob
 
 	// If the cronjob has a concurrency policy, process it.
 	// isAddqueueAfter indicates whether the cronjob should be requeued after processing.
-	print("processConcurrencyPolicy\n")
 	isAddqueueAfter, statusAfterProcessCC, err := cc.processConcurrencyPolicy(cronJob)
-	print("isAddqueueAfter:", isAddqueueAfter, "\n")
 	updateStatus = updateStatus || statusAfterProcessCC
 	if err != nil {
 		return nil, updateStatus, err
@@ -285,7 +277,6 @@ func (cc *cronjobcontroller) syncCronJob(cronJob *batchv1.CronJob, jobsByCronJob
 	}
 
 	// create a new job
-	print("createJob\n")
 	job, err := cc.createJob(cronJob, *scheduledTime)
 	if err != nil {
 		return nil, updateStatus, err
@@ -297,8 +288,6 @@ func (cc *cronjobcontroller) syncCronJob(cronJob *batchv1.CronJob, jobsByCronJob
 
 	// Add the job to the active list of the cronjob
 	// and update the last schedule time.
-	print("getRef\n")
-	// fmt.Printf("Created Job: %+v\n", job)
 	jobRef, err := getRef(job)
 	if err != nil {
 		klog.V(2).Info("Unable to make object reference", "cronjob", klog.KObj(cronJob), "err", err)
@@ -306,7 +295,6 @@ func (cc *cronjobcontroller) syncCronJob(cronJob *batchv1.CronJob, jobsByCronJob
 	}
 	cronJob.Status.Active = append(cronJob.Status.Active, *jobRef)
 	cronJob.Status.LastScheduleTime = &metav1.Time{Time: *scheduledTime}
-	print("cronJob.Status.LastScheduleTime: ", cronJob.Status.LastScheduleTime, "\n")
 	updateStatus = true
 
 	t := nextScheduleTimeDuration(cronJob, now, sch)
