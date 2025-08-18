@@ -208,8 +208,10 @@ func (cc *cronjobcontroller) processFinishedJobs(cronJob *batchv1.CronJob, jobsB
 					updateStatus = true
 				}
 				successfulJobs = append(successfulJobs, job)
+				print("find job delete, add to suc, name:", job.Name, "\n")
 			case batchv1.Failed:
 				failedJobs = append(failedJobs, job)
+				print("find job delete, add to fail, name:", job.Name, "\n")
 			}
 		}
 	}
@@ -308,9 +310,9 @@ func (cc *cronjobcontroller) removeOldestJobs(cj *batchv1.CronJob, js []*batchv1
 		return updateStatus
 	}
 	klog.V(4).Info("Cleaning up jobs from CronJob list", "deletejobnum", numToDelete, "jobnum", len(js), "cronjob", klog.KObj(cj))
-	print("sort\n")
+	print("find job delete, sort\n")
 	sort.Sort(byJobCreationTimestamp(js))
-	print("len(js):", len(js), " maxJobs:", int(maxJobs), "\n")
+	print("find job delete, len(js):", len(js), " maxJobs:", int(maxJobs), "\n")
 	for i := 0; i < numToDelete; i++ {
 		klog.V(4).Info("Removing job from CronJob list", "job", js[i].Name, "cronjob", klog.KObj(cj))
 		if deleteJobByClient(cc.vcClient, cc.jobClient, cj, js[i], cc.recorder) {
@@ -397,7 +399,7 @@ func (cc *cronjobcontroller) processConcurrencyPolicy(cj *batchv1.CronJob) (bool
 					cc.recorder.Eventf(cj, corev1.EventTypeWarning, "FailedGet", "Get job: %v", err)
 					return false, updateStatus, err
 				}
-				print("concurrent\n")
+				print("find job delete, concurrent\n")
 				if !deleteJobByClient(cc.vcClient, cc.jobClient, cj, job, cc.recorder) {
 					return false, updateStatus, fmt.Errorf("could not replace job %s/%s", job.Namespace, job.Name)
 				}
