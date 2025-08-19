@@ -231,31 +231,67 @@ func deleteCronJob(ctx *e2eutil.TestContext, ns, name string) error {
 	return ctx.Vcclient.BatchV1alpha1().CronJobs(ns).Delete(
 		context.TODO(), name, metav1.DeleteOptions{})
 }
+
+// func getJobList(ctx *e2eutil.TestContext, cronJob *v1alpha1.CronJob) (*v1alpha1.JobList, error) {
+// 	print("ns+name:", cronJob.Namespace, cronJob.Name, "\n")
+// 	jobList, err := ctx.Vcclient.BatchV1alpha1().Jobs(ctx.Namespace).List(
+// 		context.TODO(), metav1.ListOptions{})
+// 	if err != nil {
+// 		return nil, fmt.Errorf("failed to list jobs: %w", err)
+// 	}
+
+// 	var filteredJobs []v1alpha1.Job
+// 	for _, job := range jobList.Items {
+// 		controllerRef := metav1.GetControllerOf(&job)
+// 		if controllerRef == nil {
+// 			continue
+// 		}
+
+//			if controllerRef.Kind == "CronJob" &&
+//				controllerRef.APIVersion == v1alpha1.SchemeGroupVersion.String() &&
+//				controllerRef.Name == cronJob.Name &&
+//				controllerRef.UID == cronJob.UID {
+//				filteredJobs = append(filteredJobs, job)
+//			}
+//		}
+//		return &v1alpha1.JobList{
+//			Items: filteredJobs,
+//		}, nil
+//	}
 func getJobList(ctx *e2eutil.TestContext, cronJob *v1alpha1.CronJob) (*v1alpha1.JobList, error) {
-	print("ns+name:", cronJob.Namespace, cronJob.Name, "\n")
 	jobList, err := ctx.Vcclient.BatchV1alpha1().Jobs(ctx.Namespace).List(
 		context.TODO(), metav1.ListOptions{})
-	count := 0
 	if err != nil {
 		return nil, fmt.Errorf("failed to list jobs: %w", err)
 	}
 
+	fmt.Printf("\n检查%d个Job的ControllerRef:\n", len(jobList.Items))
+
 	var filteredJobs []v1alpha1.Job
 	for _, job := range jobList.Items {
-		count++
 		controllerRef := metav1.GetControllerOf(&job)
+
 		if controllerRef == nil {
+			fmt.Printf("Job %s: 无ControllerRef\n", job.Name)
 			continue
 		}
+
+		fmt.Printf("Job %s: Controller=%s/%s, UID=%s\n",
+			job.Name, controllerRef.Kind, controllerRef.Name, string(controllerRef.UID)[:8])
 
 		if controllerRef.Kind == "CronJob" &&
 			controllerRef.APIVersion == v1alpha1.SchemeGroupVersion.String() &&
 			controllerRef.Name == cronJob.Name &&
 			controllerRef.UID == cronJob.UID {
+			fmt.Printf("  ✅ 匹配目标CronJob\n")
 			filteredJobs = append(filteredJobs, job)
+		} else {
+			fmt.Printf("  ❌ 不匹配\n")
 		}
 	}
-	print(count, "\n")
+
+	fmt.Printf("找到%d个匹配的Job\n", len(filteredJobs))
+
 	return &v1alpha1.JobList{
 		Items: filteredJobs,
 	}, nil
