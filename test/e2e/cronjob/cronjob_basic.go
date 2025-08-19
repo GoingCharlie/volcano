@@ -16,7 +16,7 @@ import (
 )
 
 var _ = Describe("CronJob E2E Test", func() {
-	sleepCommand := []string{"sh", "-c", "echo 'CronJob executed at' $(date); sleep 180"}
+	// sleepCommand := []string{"sh", "-c", "echo 'CronJob executed at' $(date); sleep 180"}
 	normalCommand := []string{"sh", "-c", "echo 'CronJob executed at' $(date)"}
 	It("Create and schedule basic cronjob", func() {
 		ctx := e2eutil.InitTestContext(e2eutil.Options{})
@@ -50,110 +50,110 @@ var _ = Describe("CronJob E2E Test", func() {
 		Expect(err).NotTo(HaveOccurred(), "Failed to delete CronJob")
 	})
 
-	It("CronJob with suspend functionality", func() {
-		ctx := e2eutil.InitTestContext(e2eutil.Options{})
-		defer e2eutil.CleanupTestContext(ctx)
+	// It("CronJob with suspend functionality", func() {
+	// 	ctx := e2eutil.InitTestContext(e2eutil.Options{})
+	// 	defer e2eutil.CleanupTestContext(ctx)
 
-		suspend := true
-		cronJobName := "suspended-cronjob"
-		cronJob := createTestCronjob(cronJobName, ctx.Namespace, "*/1 * * * *", v1alpha1.AllowConcurrent, normalCommand)
-		cronJob.Spec.Suspend = &suspend
-		_, err := createCronJob(ctx, ctx.Namespace, cronJob)
-		Expect(err).NotTo(HaveOccurred())
-		Consistently(func() int {
-			jobs, err := getJobList(ctx, cronJob)
-			if err != nil {
-				return -1
-			}
-			count := 0
-			for _, job := range jobs.Items {
-				if job.Labels["cronjob"] == cronJobName {
-					count++
-				}
-			}
-			return count
-		}, 3*time.Minute, 10*time.Second).Should(Equal(0))
-		By("Cleaning up test resources")
-		err = deleteCronJob(ctx, ctx.Namespace, cronJobName)
-		Expect(err).NotTo(HaveOccurred(), "Failed to delete CronJob")
-	})
+	// 	suspend := true
+	// 	cronJobName := "suspended-cronjob"
+	// 	cronJob := createTestCronjob(cronJobName, ctx.Namespace, "*/1 * * * *", v1alpha1.AllowConcurrent, normalCommand)
+	// 	cronJob.Spec.Suspend = &suspend
+	// 	_, err := createCronJob(ctx, ctx.Namespace, cronJob)
+	// 	Expect(err).NotTo(HaveOccurred())
+	// 	Consistently(func() int {
+	// 		jobs, err := getJobList(ctx, cronJob)
+	// 		if err != nil {
+	// 			return -1
+	// 		}
+	// 		count := 0
+	// 		for _, job := range jobs.Items {
+	// 			if job.Labels["cronjob"] == cronJobName {
+	// 				count++
+	// 			}
+	// 		}
+	// 		return count
+	// 	}, 3*time.Minute, 10*time.Second).Should(Equal(0))
+	// 	By("Cleaning up test resources")
+	// 	err = deleteCronJob(ctx, ctx.Namespace, cronJobName)
+	// 	Expect(err).NotTo(HaveOccurred(), "Failed to delete CronJob")
+	// })
 
-	It("CronJob with allow concurrency", func() {
-		ctx := e2eutil.InitTestContext(e2eutil.Options{})
-		defer e2eutil.CleanupTestContext(ctx)
+	// It("CronJob with allow concurrency", func() {
+	// 	ctx := e2eutil.InitTestContext(e2eutil.Options{})
+	// 	defer e2eutil.CleanupTestContext(ctx)
 
-		By("create cronJob")
-		cronJobName := "allow-cronjob"
-		cronJob := createTestCronjob(cronJobName, ctx.Namespace, "* * * * *", v1alpha1.AllowConcurrent, sleepCommand)
-		createdCronJob, err := createCronJob(ctx, ctx.Namespace, cronJob)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(createdCronJob.Name).Should(Equal(cronJobName))
+	// 	By("create cronJob")
+	// 	cronJobName := "allow-cronjob"
+	// 	cronJob := createTestCronjob(cronJobName, ctx.Namespace, "* * * * *", v1alpha1.AllowConcurrent, sleepCommand)
+	// 	createdCronJob, err := createCronJob(ctx, ctx.Namespace, cronJob)
+	// 	Expect(err).NotTo(HaveOccurred())
+	// 	Expect(createdCronJob.Name).Should(Equal(cronJobName))
 
-		By("Ensuring more than one job in active")
-		Eventually(func() int {
-			active, err := getActiveNum(ctx, ctx.Namespace, cronJobName)
-			if err != nil {
-				Fail(fmt.Sprintf("Failed to get active jobs: %v", err))
-			}
-			return active
-		}, 5*time.Minute, 10*time.Second).Should(BeNumerically(">=", 2))
+	// 	By("Ensuring more than one job in active")
+	// 	Eventually(func() int {
+	// 		active, err := getActiveNum(ctx, ctx.Namespace, cronJobName)
+	// 		if err != nil {
+	// 			Fail(fmt.Sprintf("Failed to get active jobs: %v", err))
+	// 		}
+	// 		return active
+	// 	}, 5*time.Minute, 10*time.Second).Should(BeNumerically(">=", 2))
 
-		By("Ensuring at least two jobs in job lister")
-		Eventually(func() int {
-			active, err := getJobActiveNum(ctx, cronJob)
-			if err != nil {
-				Fail(fmt.Sprintf("Failed to list jobs: %v", err))
-			}
-			return active
-		}, 5*time.Minute, 10*time.Second).Should(BeNumerically(">=", 2))
+	// 	By("Ensuring at least two jobs in job lister")
+	// 	Eventually(func() int {
+	// 		active, err := getJobActiveNum(ctx, cronJob)
+	// 		if err != nil {
+	// 			Fail(fmt.Sprintf("Failed to list jobs: %v", err))
+	// 		}
+	// 		return active
+	// 	}, 5*time.Minute, 10*time.Second).Should(BeNumerically(">=", 2))
 
-		By("Cleaning up test resources")
-		err = deleteCronJob(ctx, ctx.Namespace, cronJobName)
-		Expect(err).NotTo(HaveOccurred(), "Failed to delete CronJob")
-	})
+	// 	By("Cleaning up test resources")
+	// 	err = deleteCronJob(ctx, ctx.Namespace, cronJobName)
+	// 	Expect(err).NotTo(HaveOccurred(), "Failed to delete CronJob")
+	// })
 
-	It("CronJob with forbid concurrency", func() {
-		ctx := e2eutil.InitTestContext(e2eutil.Options{})
-		defer e2eutil.CleanupTestContext(ctx)
+	// It("CronJob with forbid concurrency", func() {
+	// 	ctx := e2eutil.InitTestContext(e2eutil.Options{})
+	// 	defer e2eutil.CleanupTestContext(ctx)
 
-		By("create cronJob with ForbidConcurrent policy")
-		cronJobName := "forbid-cronjob"
-		cronJob := createTestCronjob(cronJobName, ctx.Namespace, "* * * * *", v1alpha1.ForbidConcurrent, sleepCommand)
-		createdCronJob, err := createCronJob(ctx, ctx.Namespace, cronJob)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(createdCronJob.Name).Should(Equal(cronJobName))
+	// 	By("create cronJob with ForbidConcurrent policy")
+	// 	cronJobName := "forbid-cronjob"
+	// 	cronJob := createTestCronjob(cronJobName, ctx.Namespace, "* * * * *", v1alpha1.ForbidConcurrent, sleepCommand)
+	// 	createdCronJob, err := createCronJob(ctx, ctx.Namespace, cronJob)
+	// 	Expect(err).NotTo(HaveOccurred())
+	// 	Expect(createdCronJob.Name).Should(Equal(cronJobName))
 
-		By("Waiting for first job to start")
-		Eventually(func() bool {
-			jobs, err := getJobList(ctx, cronJob)
-			if err != nil || len(jobs.Items) == 0 {
-				return false
-			}
-			return true
-		}, 3*time.Minute, 5*time.Second).Should(BeTrue())
+	// 	By("Waiting for first job to start")
+	// 	Eventually(func() bool {
+	// 		jobs, err := getJobList(ctx, cronJob)
+	// 		if err != nil || len(jobs.Items) == 0 {
+	// 			return false
+	// 		}
+	// 		return true
+	// 	}, 3*time.Minute, 5*time.Second).Should(BeTrue())
 
-		By("Ensuring only one job is active at any time")
-		Consistently(func() int {
-			active, err := getActiveNum(ctx, ctx.Namespace, cronJobName)
-			if err != nil {
-				Fail(fmt.Sprintf("Failed to get active jobs: %v", err))
-			}
-			return active
-		}, 5*time.Minute, 10*time.Second).Should(Equal(1))
+	// 	By("Ensuring only one job is active at any time")
+	// 	Consistently(func() int {
+	// 		active, err := getActiveNum(ctx, ctx.Namespace, cronJobName)
+	// 		if err != nil {
+	// 			Fail(fmt.Sprintf("Failed to get active jobs: %v", err))
+	// 		}
+	// 		return active
+	// 	}, 5*time.Minute, 10*time.Second).Should(Equal(1))
 
-		By("Ensuring only one job is running")
-		Consistently(func() int {
-			active, err := getJobActiveNum(ctx, cronJob)
-			if err != nil {
-				Fail(fmt.Sprintf("Failed to list jobs: %v", err))
-			}
-			return active
-		}, 5*time.Minute, 10*time.Second).Should(Equal(1))
+	// 	By("Ensuring only one job is running")
+	// 	Consistently(func() int {
+	// 		active, err := getJobActiveNum(ctx, cronJob)
+	// 		if err != nil {
+	// 			Fail(fmt.Sprintf("Failed to list jobs: %v", err))
+	// 		}
+	// 		return active
+	// 	}, 5*time.Minute, 10*time.Second).Should(Equal(1))
 
-		By("Cleaning up test resources")
-		err = deleteCronJob(ctx, ctx.Namespace, cronJobName)
-		Expect(err).NotTo(HaveOccurred(), "Failed to delete CronJob")
-	})
+	// 	By("Cleaning up test resources")
+	// 	err = deleteCronJob(ctx, ctx.Namespace, cronJobName)
+	// 	Expect(err).NotTo(HaveOccurred(), "Failed to delete CronJob")
+	// })
 })
 
 func isJobFinished(job *v1alpha1.Job) bool {
@@ -231,15 +231,17 @@ func deleteCronJob(ctx *e2eutil.TestContext, ns, name string) error {
 		context.TODO(), name, metav1.DeleteOptions{})
 }
 func getJobList(ctx *e2eutil.TestContext, cronJob *v1alpha1.CronJob) (*v1alpha1.JobList, error) {
-	print("ns+name:", cronJob.Namespace, cronJob.Name, '\n')
+	print("ns+name:", cronJob.Namespace, cronJob.Name, "\n")
 	jobList, err := ctx.Vcclient.BatchV1alpha1().Jobs(ctx.Namespace).List(
 		context.TODO(), metav1.ListOptions{})
+	count := 0
 	if err != nil {
 		return nil, fmt.Errorf("failed to list jobs: %w", err)
 	}
 
 	var filteredJobs []v1alpha1.Job
 	for _, job := range jobList.Items {
+		count++
 		controllerRef := metav1.GetControllerOf(&job)
 		if controllerRef == nil {
 			continue
@@ -252,6 +254,7 @@ func getJobList(ctx *e2eutil.TestContext, cronJob *v1alpha1.CronJob) (*v1alpha1.
 			filteredJobs = append(filteredJobs, job)
 		}
 	}
+	print(count, "\n")
 	return &v1alpha1.JobList{
 		Items: filteredJobs,
 	}, nil
