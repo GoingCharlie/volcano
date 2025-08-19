@@ -38,7 +38,7 @@ var _ = Describe("CronJob E2E Test", func() {
 		}, 3*time.Minute, 10*time.Second).Should(BeTrue())
 
 		Eventually(func() int {
-			jobs, err := getJobList(ctx, "cronjob="+cronJobName)
+			jobs, err := getJobList(ctx, cronJob)
 			if err != nil {
 				return 0
 			}
@@ -61,7 +61,7 @@ var _ = Describe("CronJob E2E Test", func() {
 		_, err := createCronJob(ctx, ctx.Namespace, cronJob)
 		Expect(err).NotTo(HaveOccurred())
 		Consistently(func() int {
-			jobs, err := getJobList(ctx, "")
+			jobs, err := getJobList(ctx, cronJob)
 			if err != nil {
 				return -1
 			}
@@ -100,7 +100,7 @@ var _ = Describe("CronJob E2E Test", func() {
 
 		By("Ensuring at least two jobs in job lister")
 		Eventually(func() int {
-			active, err := getJobActiveNum(ctx, "cronjob="+cronJobName)
+			active, err := getJobActiveNum(ctx, cronJob)
 			if err != nil {
 				Fail(fmt.Sprintf("Failed to list jobs: %v", err))
 			}
@@ -125,7 +125,7 @@ var _ = Describe("CronJob E2E Test", func() {
 
 		By("Waiting for first job to start")
 		Eventually(func() bool {
-			jobs, err := getJobList(ctx, "cronjob="+cronJobName)
+			jobs, err := getJobList(ctx, cronJob)
 			if err != nil || len(jobs.Items) == 0 {
 				return false
 			}
@@ -143,18 +143,11 @@ var _ = Describe("CronJob E2E Test", func() {
 
 		By("Ensuring only one job is running")
 		Consistently(func() int {
-			jobs, err := getJobList(ctx, "cronjob="+cronJobName)
+			active, err := getJobActiveNum(ctx, cronJob)
 			if err != nil {
 				Fail(fmt.Sprintf("Failed to list jobs: %v", err))
 			}
-
-			count := 0
-			for _, job := range jobs.Items {
-				if !isJobFinished(&job) {
-					count++
-				}
-			}
-			return count
+			return active
 		}, 5*time.Minute, 10*time.Second).Should(Equal(1))
 
 		By("Cleaning up test resources")
@@ -204,8 +197,8 @@ func createTestCronjob(name, nameSpace, schedule string, concurrency v1alpha1.Co
 		},
 	}
 }
-func getJobActiveNum(ctx *e2eutil.TestContext, selector string) (int, error) {
-	jobs, err := getJobList(ctx, selector)
+func getJobActiveNum(ctx *e2eutil.TestContext, cronJob *v1alpha1.CronJob) (int, error) {
+	jobs, err := getJobList(ctx, cronJob)
 	if err != nil {
 		return -1, err
 	}
@@ -224,14 +217,7 @@ func getActiveNum(ctx *e2eutil.TestContext, ns, name string) (int, error) {
 	}
 	return len(cronjob.Status.Active), nil
 }
-func getJobList(ctx *e2eutil.TestContext, selector string) (*v1alpha1.JobList, error) {
-	listOptions := metav1.ListOptions{}
-	if selector != "" {
-		listOptions.LabelSelector = selector
-	}
-	return ctx.Vcclient.BatchV1alpha1().Jobs(ctx.Namespace).List(
-		context.TODO(), listOptions)
-}
+
 func createCronJob(ctx *e2eutil.TestContext, ns string, cronJob *v1alpha1.CronJob) (*v1alpha1.CronJob, error) {
 	return ctx.Vcclient.BatchV1alpha1().CronJobs(ns).Create(
 		context.TODO(), cronJob, metav1.CreateOptions{})
@@ -243,4 +229,31 @@ func getCronJob(ctx *e2eutil.TestContext, ns, name string) (*v1alpha1.CronJob, e
 func deleteCronJob(ctx *e2eutil.TestContext, ns, name string) error {
 	return ctx.Vcclient.BatchV1alpha1().CronJobs(ns).Delete(
 		context.TODO(), name, metav1.DeleteOptions{})
+}
+func getJobList(ctx *e2eutil.TestContext, cronJob *v1alpha1.CronJob) (*v1alpha1.JobList, error) {
+
+	jobList, err := ctx.Vcclient.BatchV1alpha1().Jobs(ctx.Namespace).List(
+		context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list jobs: %w", err)
+	}
+
+	var filteredJobs []v1alpha1.Job
+	for _, job := range jobList.Items {
+		controllerRef := metav1.GetControllerOf(&job)
+		if controllerRef == nil {
+			continue
+		}
+
+		if controllerRef.Kind == "CronJob" &&
+			controllerRef.APIVersion == v1alpha1.SchemeGroupVersion.String() &&
+			controllerRef.Name == cronJob.Name &&
+			controllerRef.UID == cronJob.UID {
+			filteredJobs = append(filteredJobs, job)
+		}
+	}
+
+	return &v1alpha1.JobList{
+		Items: filteredJobs,
+	}, nil
 }
