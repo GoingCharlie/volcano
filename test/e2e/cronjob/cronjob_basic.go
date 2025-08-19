@@ -156,12 +156,12 @@ var _ = Describe("CronJob E2E Test", func() {
 	// })
 })
 
-func isJobFinished(job *v1alpha1.Job) bool {
-	if job.Status.State.Phase == v1alpha1.Completed || job.Status.State.Phase == v1alpha1.Failed || job.Status.State.Phase == v1alpha1.Terminated {
-		return true
-	}
-	return false
-}
+//	func isJobFinished(job *v1alpha1.Job) bool {
+//		if job.Status.State.Phase == v1alpha1.Completed || job.Status.State.Phase == v1alpha1.Failed || job.Status.State.Phase == v1alpha1.Terminated {
+//			return true
+//		}
+//		return false
+//	}
 func createTestCronjob(name, nameSpace, schedule string, concurrency v1alpha1.ConcurrencyPolicy, command []string) *v1alpha1.CronJob {
 	return &v1alpha1.CronJob{
 		ObjectMeta: metav1.ObjectMeta{
@@ -197,26 +197,27 @@ func createTestCronjob(name, nameSpace, schedule string, concurrency v1alpha1.Co
 		},
 	}
 }
-func getJobActiveNum(ctx *e2eutil.TestContext, cronJob *v1alpha1.CronJob) (int, error) {
-	jobs, err := getJobList(ctx, cronJob)
-	if err != nil {
-		return -1, err
-	}
-	activeCount := 0
-	for _, job := range jobs.Items {
-		if !isJobFinished(&job) {
-			activeCount++
-		}
-	}
-	return activeCount, nil
-}
-func getActiveNum(ctx *e2eutil.TestContext, ns, name string) (int, error) {
-	cronjob, err := getCronJob(ctx, ns, name)
-	if err != nil {
-		return -1, err
-	}
-	return len(cronjob.Status.Active), nil
-}
+
+// func getJobActiveNum(ctx *e2eutil.TestContext, cronJob *v1alpha1.CronJob) (int, error) {
+// 	jobs, err := getJobList(ctx, cronJob)
+// 	if err != nil {
+// 		return -1, err
+// 	}
+// 	activeCount := 0
+// 	for _, job := range jobs.Items {
+// 		if !isJobFinished(&job) {
+// 			activeCount++
+// 		}
+// 	}
+// 	return activeCount, nil
+// }
+// func getActiveNum(ctx *e2eutil.TestContext, ns, name string) (int, error) {
+// 	cronjob, err := getCronJob(ctx, ns, name)
+// 	if err != nil {
+// 		return -1, err
+// 	}
+// 	return len(cronjob.Status.Active), nil
+// }
 
 func createCronJob(ctx *e2eutil.TestContext, ns string, cronJob *v1alpha1.CronJob) (*v1alpha1.CronJob, error) {
 	return ctx.Vcclient.BatchV1alpha1().CronJobs(ns).Create(
