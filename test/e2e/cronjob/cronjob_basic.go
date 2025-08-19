@@ -266,31 +266,67 @@ func getJobList(ctx *e2eutil.TestContext, cronJob *v1alpha1.CronJob) (*v1alpha1.
 	}
 
 	fmt.Printf("\n检查%d个Job的ControllerRef:\n", len(jobList.Items))
+	fmt.Printf("目标CronJob: Name=%s, UID=%s, APIVersion=%s\n",
+		cronJob.Name, string(cronJob.UID)[:8], v1alpha1.SchemeGroupVersion.String())
 
 	var filteredJobs []v1alpha1.Job
 	for _, job := range jobList.Items {
 		controllerRef := metav1.GetControllerOf(&job)
 
 		if controllerRef == nil {
-			fmt.Printf("Job %s: 无ControllerRef\n", job.Name)
+			fmt.Printf("Job %s: ❌ 无ControllerRef（不是由控制器创建的）\n", job.Name)
 			continue
 		}
 
-		fmt.Printf("Job %s: Controller=%s/%s, UID=%s\n",
-			job.Name, controllerRef.Kind, controllerRef.Name, string(controllerRef.UID)[:8])
+		fmt.Printf("\nJob %s: Controller=%s/%s, UID=%s, APIVersion=%s\n",
+			job.Name, controllerRef.Kind, controllerRef.Name,
+			string(controllerRef.UID)[:8], controllerRef.APIVersion)
 
-		if controllerRef.Kind == "CronJob" &&
-			controllerRef.APIVersion == v1alpha1.SchemeGroupVersion.String() &&
-			controllerRef.Name == cronJob.Name &&
-			controllerRef.UID == cronJob.UID {
-			fmt.Printf("  ✅ 匹配目标CronJob\n")
+		// 详细检查每个匹配条件
+		kindMatch := controllerRef.Kind == "CronJob"
+		apiVersionMatch := controllerRef.APIVersion == v1alpha1.SchemeGroupVersion.String()
+		nameMatch := controllerRef.Name == cronJob.Name
+		uidMatch := controllerRef.UID == cronJob.UID
+
+		fmt.Printf("  匹配检查:\n")
+		fmt.Printf("    Kind: %v (期望: CronJob, 实际: %s)\n", kindMatch, controllerRef.Kind)
+		fmt.Printf("    APIVersion: %v (期望: %s, 实际: %s)\n",
+			apiVersionMatch, v1alpha1.SchemeGroupVersion.String(), controllerRef.APIVersion)
+		fmt.Printf("    Name: %v (期望: %s, 实际: %s)\n",
+			nameMatch, cronJob.Name, controllerRef.Name)
+		fmt.Printf("    UID: %v (期望: %s..., 实际: %s...)\n",
+			uidMatch, string(cronJob.UID)[:8], string(controllerRef.UID)[:8])
+
+		if kindMatch && apiVersionMatch && nameMatch && uidMatch {
+			fmt.Printf("  ✅ 所有条件匹配目标CronJob\n")
 			filteredJobs = append(filteredJobs, job)
 		} else {
-			fmt.Printf("  ❌ 不匹配\n")
+			fmt.Printf("  ❌ 不匹配目标CronJob\n")
+			// 显示具体不匹配的条件
+			if !kindMatch {
+				fmt.Printf("    ❗ Kind不匹配\n")
+			}
+			if !apiVersionMatch {
+				fmt.Printf("    ❗ APIVersion不匹配\n")
+			}
+			if !nameMatch {
+				fmt.Printf("    ❗ Name不匹配\n")
+			}
+			if !uidMatch {
+				fmt.Printf("    ❗ UID不匹配\n")
+			}
 		}
 	}
 
-	fmt.Printf("找到%d个匹配的Job\n", len(filteredJobs))
+	fmt.Printf("\n=== 最终结果 ===\n")
+	fmt.Printf("找到%d个匹配的Job（属于CronJob %s）\n", len(filteredJobs), cronJob.Name)
+
+	if len(filteredJobs) > 0 {
+		fmt.Printf("匹配的Job列表:\n")
+		for i, job := range filteredJobs {
+			fmt.Printf("  %d. %s\n", i+1, job.Name)
+		}
+	}
 
 	return &v1alpha1.JobList{
 		Items: filteredJobs,
