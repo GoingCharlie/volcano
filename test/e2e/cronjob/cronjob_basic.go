@@ -19,7 +19,7 @@ var _ = Describe("CronJob E2E Test", func() {
 	sleepCommand := []string{"sh", "-c", "echo 'CronJob executed at' $(date); sleep 180"}
 	normalCommand := []string{"sh", "-c", "echo 'CronJob executed at' $(date)"}
 	It("Create and schedule basic cronjob", func() {
-		ctx := e2eutil.InitTestContext(e2eutil.Options{})
+		ctx := e2eutil.InitTestContext(e2eutil.Options{Namespace: "default"})
 		defer e2eutil.CleanupTestContext(ctx)
 
 		cronJobName := "test-cronjob"
@@ -51,7 +51,7 @@ var _ = Describe("CronJob E2E Test", func() {
 	})
 
 	It("CronJob with suspend functionality", func() {
-		ctx := e2eutil.InitTestContext(e2eutil.Options{})
+		ctx := e2eutil.InitTestContext(e2eutil.Options{Namespace: "default"})
 		defer e2eutil.CleanupTestContext(ctx)
 
 		suspend := true
@@ -79,7 +79,7 @@ var _ = Describe("CronJob E2E Test", func() {
 	})
 
 	It("CronJob with allow concurrency", func() {
-		ctx := e2eutil.InitTestContext(e2eutil.Options{})
+		ctx := e2eutil.InitTestContext(e2eutil.Options{Namespace: "default"})
 		defer e2eutil.CleanupTestContext(ctx)
 
 		By("create cronJob")
@@ -113,7 +113,7 @@ var _ = Describe("CronJob E2E Test", func() {
 	})
 
 	It("CronJob with forbid concurrency", func() {
-		ctx := e2eutil.InitTestContext(e2eutil.Options{})
+		ctx := e2eutil.InitTestContext(e2eutil.Options{Namespace: "default"})
 		defer e2eutil.CleanupTestContext(ctx)
 
 		By("create cronJob with ForbidConcurrent policy")
