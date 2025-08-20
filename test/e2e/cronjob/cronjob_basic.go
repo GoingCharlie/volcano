@@ -16,7 +16,7 @@ import (
 )
 
 var _ = Describe("CronJob E2E Test", func() {
-	// sleepCommand := []string{"sh", "-c", "echo 'CronJob executed at' $(date); sleep 180"}
+	sleepCommand := []string{"sh", "-c", "echo 'CronJob executed at' $(date); sleep 180"}
 	normalCommand := []string{"sh", "-c", "echo 'CronJob executed at' $(date)"}
 	It("Create and schedule basic cronjob", func() {
 		ctx := e2eutil.InitTestContext(e2eutil.Options{})
@@ -50,118 +50,112 @@ var _ = Describe("CronJob E2E Test", func() {
 		Expect(err).NotTo(HaveOccurred(), "Failed to delete CronJob")
 	})
 
-	// It("CronJob with suspend functionality", func() {
-	// 	ctx := e2eutil.InitTestContext(e2eutil.Options{})
-	// 	defer e2eutil.CleanupTestContext(ctx)
+	It("CronJob with suspend functionality", func() {
+		ctx := e2eutil.InitTestContext(e2eutil.Options{})
+		defer e2eutil.CleanupTestContext(ctx)
 
-	// 	suspend := true
-	// 	cronJobName := "suspended-cronjob"
-	// 	cronJob := createTestCronjob(cronJobName, ctx.Namespace, "*/1 * * * *", v1alpha1.AllowConcurrent, normalCommand)
-	// 	cronJob.Spec.Suspend = &suspend
-	// 	_, err := createCronJob(ctx, ctx.Namespace, cronJob)
-	// 	Expect(err).NotTo(HaveOccurred())
-	// 	Consistently(func() int {
-	// 		jobs, err := getJobList(ctx, cronJob)
-	// 		if err != nil {
-	// 			return -1
-	// 		}
-	// 		count := 0
-	// 		for _, job := range jobs.Items {
-	// 			if job.Labels["cronjob"] == cronJobName {
-	// 				count++
-	// 			}
-	// 		}
-	// 		return count
-	// 	}, 3*time.Minute, 10*time.Second).Should(Equal(0))
-	// 	By("Cleaning up test resources")
-	// 	err = deleteCronJob(ctx, ctx.Namespace, cronJobName)
-	// 	Expect(err).NotTo(HaveOccurred(), "Failed to delete CronJob")
-	// })
+		suspend := true
+		cronJobName := "suspended-cronjob"
+		cronJob := createTestCronjob(cronJobName, ctx.Namespace, "*/1 * * * *", v1alpha1.AllowConcurrent, normalCommand)
+		cronJob.Spec.Suspend = &suspend
+		createdCronJob, err := createCronJob(ctx, ctx.Namespace, cronJob)
+		Expect(err).NotTo(HaveOccurred())
+		Consistently(func() int {
+			jobs, err := getJobList(ctx, createdCronJob)
+			if err != nil {
+				return -1
+			}
+			return len(jobs.Items)
+		}, 3*time.Minute, 10*time.Second).Should(Equal(0))
+		By("Cleaning up test resources")
+		err = deleteCronJob(ctx, ctx.Namespace, cronJobName)
+		Expect(err).NotTo(HaveOccurred(), "Failed to delete CronJob")
+	})
 
-	// It("CronJob with allow concurrency", func() {
-	// 	ctx := e2eutil.InitTestContext(e2eutil.Options{})
-	// 	defer e2eutil.CleanupTestContext(ctx)
+	It("CronJob with allow concurrency", func() {
+		ctx := e2eutil.InitTestContext(e2eutil.Options{})
+		defer e2eutil.CleanupTestContext(ctx)
 
-	// 	By("create cronJob")
-	// 	cronJobName := "allow-cronjob"
-	// 	cronJob := createTestCronjob(cronJobName, ctx.Namespace, "* * * * *", v1alpha1.AllowConcurrent, sleepCommand)
-	// 	createdCronJob, err := createCronJob(ctx, ctx.Namespace, cronJob)
-	// 	Expect(err).NotTo(HaveOccurred())
-	// 	Expect(createdCronJob.Name).Should(Equal(cronJobName))
+		By("create cronJob")
+		cronJobName := "allow-cronjob"
+		cronJob := createTestCronjob(cronJobName, ctx.Namespace, "* * * * *", v1alpha1.AllowConcurrent, sleepCommand)
+		createdCronJob, err := createCronJob(ctx, ctx.Namespace, cronJob)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(createdCronJob.Name).Should(Equal(cronJobName))
 
-	// 	By("Ensuring more than one job in active")
-	// 	Eventually(func() int {
-	// 		active, err := getActiveNum(ctx, ctx.Namespace, cronJobName)
-	// 		if err != nil {
-	// 			Fail(fmt.Sprintf("Failed to get active jobs: %v", err))
-	// 		}
-	// 		return active
-	// 	}, 5*time.Minute, 10*time.Second).Should(BeNumerically(">=", 2))
+		By("Ensuring more than one job in active")
+		Eventually(func() int {
+			active, err := getActiveNum(ctx, ctx.Namespace, cronJobName)
+			if err != nil {
+				Fail(fmt.Sprintf("Failed to get active jobs: %v", err))
+			}
+			return active
+		}, 5*time.Minute, 10*time.Second).Should(BeNumerically(">=", 2))
 
-	// 	By("Ensuring at least two jobs in job lister")
-	// 	Eventually(func() int {
-	// 		active, err := getJobActiveNum(ctx, cronJob)
-	// 		if err != nil {
-	// 			Fail(fmt.Sprintf("Failed to list jobs: %v", err))
-	// 		}
-	// 		return active
-	// 	}, 5*time.Minute, 10*time.Second).Should(BeNumerically(">=", 2))
+		By("Ensuring at least two jobs in job lister")
+		Eventually(func() int {
+			active, err := getJobActiveNum(ctx, createdCronJob)
+			if err != nil {
+				Fail(fmt.Sprintf("Failed to list jobs: %v", err))
+			}
+			return active
+		}, 5*time.Minute, 10*time.Second).Should(BeNumerically(">=", 2))
 
-	// 	By("Cleaning up test resources")
-	// 	err = deleteCronJob(ctx, ctx.Namespace, cronJobName)
-	// 	Expect(err).NotTo(HaveOccurred(), "Failed to delete CronJob")
-	// })
+		By("Cleaning up test resources")
+		err = deleteCronJob(ctx, ctx.Namespace, cronJobName)
+		Expect(err).NotTo(HaveOccurred(), "Failed to delete CronJob")
+	})
 
-	// It("CronJob with forbid concurrency", func() {
-	// 	ctx := e2eutil.InitTestContext(e2eutil.Options{})
-	// 	defer e2eutil.CleanupTestContext(ctx)
+	It("CronJob with forbid concurrency", func() {
+		ctx := e2eutil.InitTestContext(e2eutil.Options{})
+		defer e2eutil.CleanupTestContext(ctx)
 
-	// 	By("create cronJob with ForbidConcurrent policy")
-	// 	cronJobName := "forbid-cronjob"
-	// 	cronJob := createTestCronjob(cronJobName, ctx.Namespace, "* * * * *", v1alpha1.ForbidConcurrent, sleepCommand)
-	// 	createdCronJob, err := createCronJob(ctx, ctx.Namespace, cronJob)
-	// 	Expect(err).NotTo(HaveOccurred())
-	// 	Expect(createdCronJob.Name).Should(Equal(cronJobName))
+		By("create cronJob with ForbidConcurrent policy")
+		cronJobName := "forbid-cronjob"
+		cronJob := createTestCronjob(cronJobName, ctx.Namespace, "* * * * *", v1alpha1.ForbidConcurrent, sleepCommand)
+		createdCronJob, err := createCronJob(ctx, ctx.Namespace, cronJob)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(createdCronJob.Name).Should(Equal(cronJobName))
 
-	// 	By("Waiting for first job to start")
-	// 	Eventually(func() bool {
-	// 		jobs, err := getJobList(ctx, cronJob)
-	// 		if err != nil || len(jobs.Items) == 0 {
-	// 			return false
-	// 		}
-	// 		return true
-	// 	}, 3*time.Minute, 5*time.Second).Should(BeTrue())
+		By("Waiting for first job to start")
+		Eventually(func() bool {
+			jobs, err := getJobList(ctx, createdCronJob)
+			if err != nil || len(jobs.Items) == 0 {
+				return false
+			}
+			return true
+		}, 3*time.Minute, 5*time.Second).Should(BeTrue())
 
-	// 	By("Ensuring only one job is active at any time")
-	// 	Consistently(func() int {
-	// 		active, err := getActiveNum(ctx, ctx.Namespace, cronJobName)
-	// 		if err != nil {
-	// 			Fail(fmt.Sprintf("Failed to get active jobs: %v", err))
-	// 		}
-	// 		return active
-	// 	}, 5*time.Minute, 10*time.Second).Should(Equal(1))
+		By("Ensuring only one job is active at any time")
+		Consistently(func() int {
+			active, err := getActiveNum(ctx, ctx.Namespace, cronJobName)
+			if err != nil {
+				Fail(fmt.Sprintf("Failed to get active jobs: %v", err))
+			}
+			return active
+		}, 5*time.Minute, 10*time.Second).Should(Equal(1))
 
-	// 	By("Ensuring only one job is running")
-	// 	Consistently(func() int {
-	// 		active, err := getJobActiveNum(ctx, cronJob)
-	// 		if err != nil {
-	// 			Fail(fmt.Sprintf("Failed to list jobs: %v", err))
-	// 		}
-	// 		return active
-	// 	}, 5*time.Minute, 10*time.Second).Should(Equal(1))
+		By("Ensuring only one job is running")
+		Consistently(func() int {
+			active, err := getJobActiveNum(ctx, createdCronJob)
+			if err != nil {
+				Fail(fmt.Sprintf("Failed to list jobs: %v", err))
+			}
+			return active
+		}, 5*time.Minute, 10*time.Second).Should(Equal(1))
 
-	// 	By("Cleaning up test resources")
-	// 	err = deleteCronJob(ctx, ctx.Namespace, cronJobName)
-	// 	Expect(err).NotTo(HaveOccurred(), "Failed to delete CronJob")
-	// })
+		By("Cleaning up test resources")
+		err = deleteCronJob(ctx, ctx.Namespace, cronJobName)
+		Expect(err).NotTo(HaveOccurred(), "Failed to delete CronJob")
+	})
 })
 
-//	func isJobFinished(job *v1alpha1.Job) bool {
-//		if job.Status.State.Phase == v1alpha1.Completed || job.Status.State.Phase == v1alpha1.Failed || job.Status.State.Phase == v1alpha1.Terminated {
-//			return true
-//		}
-//		return false
-//	}
+func isJobFinished(job *v1alpha1.Job) bool {
+	if job.Status.State.Phase == v1alpha1.Completed || job.Status.State.Phase == v1alpha1.Failed || job.Status.State.Phase == v1alpha1.Terminated {
+		return true
+	}
+	return false
+}
 func createTestCronjob(name, nameSpace, schedule string, concurrency v1alpha1.ConcurrencyPolicy, command []string) *v1alpha1.CronJob {
 	return &v1alpha1.CronJob{
 		ObjectMeta: metav1.ObjectMeta{
@@ -198,26 +192,26 @@ func createTestCronjob(name, nameSpace, schedule string, concurrency v1alpha1.Co
 	}
 }
 
-// func getJobActiveNum(ctx *e2eutil.TestContext, cronJob *v1alpha1.CronJob) (int, error) {
-// 	jobs, err := getJobList(ctx, cronJob)
-// 	if err != nil {
-// 		return -1, err
-// 	}
-// 	activeCount := 0
-// 	for _, job := range jobs.Items {
-// 		if !isJobFinished(&job) {
-// 			activeCount++
-// 		}
-// 	}
-// 	return activeCount, nil
-// }
-// func getActiveNum(ctx *e2eutil.TestContext, ns, name string) (int, error) {
-// 	cronjob, err := getCronJob(ctx, ns, name)
-// 	if err != nil {
-// 		return -1, err
-// 	}
-// 	return len(cronjob.Status.Active), nil
-// }
+func getJobActiveNum(ctx *e2eutil.TestContext, cronJob *v1alpha1.CronJob) (int, error) {
+	jobs, err := getJobList(ctx, cronJob)
+	if err != nil {
+		return -1, err
+	}
+	activeCount := 0
+	for _, job := range jobs.Items {
+		if !isJobFinished(&job) {
+			activeCount++
+		}
+	}
+	return activeCount, nil
+}
+func getActiveNum(ctx *e2eutil.TestContext, ns, name string) (int, error) {
+	cronjob, err := getCronJob(ctx, ns, name)
+	if err != nil {
+		return -1, err
+	}
+	return len(cronjob.Status.Active), nil
+}
 
 func createCronJob(ctx *e2eutil.TestContext, ns string, cronJob *v1alpha1.CronJob) (*v1alpha1.CronJob, error) {
 	return ctx.Vcclient.BatchV1alpha1().CronJobs(ns).Create(
@@ -232,32 +226,6 @@ func deleteCronJob(ctx *e2eutil.TestContext, ns, name string) error {
 		context.TODO(), name, metav1.DeleteOptions{})
 }
 
-// func getJobList(ctx *e2eutil.TestContext, cronJob *v1alpha1.CronJob) (*v1alpha1.JobList, error) {
-// 	print("ns+name:", cronJob.Namespace, cronJob.Name, "\n")
-// 	jobList, err := ctx.Vcclient.BatchV1alpha1().Jobs(ctx.Namespace).List(
-// 		context.TODO(), metav1.ListOptions{})
-// 	if err != nil {
-// 		return nil, fmt.Errorf("failed to list jobs: %w", err)
-// 	}
-
-// 	var filteredJobs []v1alpha1.Job
-// 	for _, job := range jobList.Items {
-// 		controllerRef := metav1.GetControllerOf(&job)
-// 		if controllerRef == nil {
-// 			continue
-// 		}
-
-//			if controllerRef.Kind == "CronJob" &&
-//				controllerRef.APIVersion == v1alpha1.SchemeGroupVersion.String() &&
-//				controllerRef.Name == cronJob.Name &&
-//				controllerRef.UID == cronJob.UID {
-//				filteredJobs = append(filteredJobs, job)
-//			}
-//		}
-//		return &v1alpha1.JobList{
-//			Items: filteredJobs,
-//		}, nil
-//	}
 func getJobList(ctx *e2eutil.TestContext, cronJob *v1alpha1.CronJob) (*v1alpha1.JobList, error) {
 	jobList, err := ctx.Vcclient.BatchV1alpha1().Jobs(ctx.Namespace).List(
 		context.TODO(), metav1.ListOptions{})
@@ -265,69 +233,20 @@ func getJobList(ctx *e2eutil.TestContext, cronJob *v1alpha1.CronJob) (*v1alpha1.
 		return nil, fmt.Errorf("failed to list jobs: %w", err)
 	}
 
-	fmt.Printf("\n检查%d个Job的ControllerRef:\n", len(jobList.Items))
-	fmt.Printf("目标CronJob: Name=%s, UID=%s, APIVersion=%s\n",
-		cronJob.Name, string(cronJob.UID)[:8], v1alpha1.SchemeGroupVersion.String())
-
 	var filteredJobs []v1alpha1.Job
 	for _, job := range jobList.Items {
 		controllerRef := metav1.GetControllerOf(&job)
-
 		if controllerRef == nil {
-			fmt.Printf("Job %s: ❌ 无ControllerRef（不是由控制器创建的）\n", job.Name)
 			continue
 		}
 
-		fmt.Printf("\nJob %s: Controller=%s/%s, UID=%s, APIVersion=%s\n",
-			job.Name, controllerRef.Kind, controllerRef.Name,
-			string(controllerRef.UID)[:8], controllerRef.APIVersion)
-
-		// 详细检查每个匹配条件
-		kindMatch := controllerRef.Kind == "CronJob"
-		apiVersionMatch := controllerRef.APIVersion == v1alpha1.SchemeGroupVersion.String()
-		nameMatch := controllerRef.Name == cronJob.Name
-		uidMatch := controllerRef.UID == cronJob.UID
-
-		fmt.Printf("  匹配检查:\n")
-		fmt.Printf("    Kind: %v (期望: CronJob, 实际: %s)\n", kindMatch, controllerRef.Kind)
-		fmt.Printf("    APIVersion: %v (期望: %s, 实际: %s)\n",
-			apiVersionMatch, v1alpha1.SchemeGroupVersion.String(), controllerRef.APIVersion)
-		fmt.Printf("    Name: %v (期望: %s, 实际: %s)\n",
-			nameMatch, cronJob.Name, controllerRef.Name)
-		fmt.Printf("    UID: %v (期望: %s..., 实际: %s...)\n",
-			uidMatch, string(cronJob.UID)[:8], string(controllerRef.UID)[:8])
-
-		if kindMatch && apiVersionMatch && nameMatch && uidMatch {
-			fmt.Printf("  ✅ 所有条件匹配目标CronJob\n")
+		if controllerRef.Kind == "CronJob" &&
+			controllerRef.APIVersion == v1alpha1.SchemeGroupVersion.String() &&
+			controllerRef.Name == cronJob.Name &&
+			controllerRef.UID == cronJob.UID {
 			filteredJobs = append(filteredJobs, job)
-		} else {
-			fmt.Printf("  ❌ 不匹配目标CronJob\n")
-			// 显示具体不匹配的条件
-			if !kindMatch {
-				fmt.Printf("    ❗ Kind不匹配\n")
-			}
-			if !apiVersionMatch {
-				fmt.Printf("    ❗ APIVersion不匹配\n")
-			}
-			if !nameMatch {
-				fmt.Printf("    ❗ Name不匹配\n")
-			}
-			if !uidMatch {
-				fmt.Printf("    ❗ UID不匹配\n")
-			}
 		}
 	}
-
-	fmt.Printf("\n=== 最终结果 ===\n")
-	fmt.Printf("找到%d个匹配的Job（属于CronJob %s）\n", len(filteredJobs), cronJob.Name)
-
-	if len(filteredJobs) > 0 {
-		fmt.Printf("匹配的Job列表:\n")
-		for i, job := range filteredJobs {
-			fmt.Printf("  %d. %s\n", i+1, job.Name)
-		}
-	}
-
 	return &v1alpha1.JobList{
 		Items: filteredJobs,
 	}, nil
