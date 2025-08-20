@@ -183,7 +183,7 @@ func (cc *cronjobcontroller) processFinishedJobs(cronJob *batchv1.CronJob, jobsB
 			//remove from active list if job is finished
 			if found := inActiveList(cronJob, job.ObjectMeta.UID); found {
 				deleteFromActiveList(cronJob, job.ObjectMeta.UID)
-				cc.recorder.Eventf(cronJob, corev1.EventTypeNormal, "SawCompletedJob", "Saw completed job: %s", job.Name)
+				cc.recorder.Eventf(cronJob, corev1.EventTypeNormal, "SawCompletedJob", "Saw completed job: %s in active, remove", job.Name)
 				updateStatus = true
 			}
 			switch phase {
@@ -228,7 +228,7 @@ func (cc *cronjobcontroller) processFinishedJobs(cronJob *batchv1.CronJob, jobsB
 
 // 1. Identifies and handles orphaned jobs (jobs owned by the CronJob but not in its active list)
 // 2. Cleans up stale references in the CronJob's active list (jobs that no longer exist or have mismatched UIDs)
-func (cc *cronjobcontroller) processCtljobAndActiveJob(cronJob *batchv1.CronJob, jobsByCronJob []*batchv1.Job) (bool, error) {
+func (cc *cronjobcontroller) processCtlJobAndActiveJob(cronJob *batchv1.CronJob, jobsByCronJob []*batchv1.Job) (bool, error) {
 	updateStatus := false
 	ctrlJobs := make(map[types.UID]bool)
 
@@ -309,11 +309,6 @@ func (cc *cronjobcontroller) removeOldestJobs(cj *batchv1.CronJob, js []*batchv1
 // deleteJobByClient attempts to delete a Job through the API server and updates the CronJob's status.
 // Returns true if deletion was successful, false otherwise.
 func deleteJobByClient(vcClient vcclientset.Interface, jobClient jobClientInterface, cc *batchv1.CronJob, job *batchv1.Job, recorder record.EventRecorder) bool {
-	const (
-		deleteSuccessEvent = "SuccessfulDelete"
-		deleteFailureEvent = "FailedDelete"
-	)
-
 	if vcClient == nil || cc == nil || job == nil {
 		klog.ErrorS(nil, "Invalid arguments provided to deleteJob",
 			"clientNil", vcClient == nil,
@@ -329,7 +324,7 @@ func deleteJobByClient(vcClient vcclientset.Interface, jobClient jobClientInterf
 		klog.ErrorS(err, "Failed to delete Job",
 			"job", klog.KObj(job),
 			"cronjob", klog.KObj(cc))
-		recorder.Eventf(cc, corev1.EventTypeWarning, deleteFailureEvent,
+		recorder.Eventf(cc, corev1.EventTypeWarning, "SuccessfulDelete",
 			"Error deleting job %q: %v", job.Name, err)
 
 		return false
@@ -337,25 +332,12 @@ func deleteJobByClient(vcClient vcclientset.Interface, jobClient jobClientInterf
 
 	// Cleanup local state after successful API deletion
 	deleteFromActiveList(cc, job.ObjectMeta.UID)
-	recorder.Eventf(cc, corev1.EventTypeNormal, deleteSuccessEvent,
+	recorder.Eventf(cc, corev1.EventTypeNormal, "FailedDelete",
 		"Deleted job %q", job.Name)
 	return true
 }
 
-func (cc *cronjobcontroller) validateTZandSchedule(cj *batchv1.CronJob, recorder record.EventRecorder) (cron.Schedule, error) {
-	if cj.Spec.TimeZone != nil {
-		timeZone := ptr.Deref(cj.Spec.TimeZone, "")
-		if _, err := time.LoadLocation(timeZone); err != nil {
-			klog.Errorf("Invalid time zone %q in CronJob %s: %v", timeZone, klog.KObj(cj), err)
-			recorder.Eventf(cj, corev1.EventTypeWarning, "InvalidTimeZone",
-				"Invalid time zone %q: %v", timeZone, err)
-			return nil, err
-		}
-	}
-	sch, err := cron.ParseStandard(formatSchedule(cj, recorder))
-	return sch, err
-}
-
+// return if addqueueAfter and updateStatus
 func (cc *cronjobcontroller) processConcurrencyPolicy(cj *batchv1.CronJob) (bool, bool, error) {
 	if cj.Spec.ConcurrencyPolicy == batchv1.ForbidConcurrent {
 		if len(cj.Status.Active) > 0 {
@@ -444,7 +426,7 @@ func (cc *cronjobcontroller) createJob(cronJob *batchv1.CronJob, scheduledTime t
 		}
 		return nil, fmt.Errorf("created job missing owner reference")
 	}
-	// metrics.CronJobCreationSkew.Observe(job.ObjectMeta.GetCreationTimestamp().Sub(scheduledTime).Seconds())
+
 	klog.V(2).Infof("Created job %s for CronJob %s", klog.KObj(job), klog.KObj(cronJob))
 	cc.recorder.Eventf(cronJob, corev1.EventTypeNormal, "SuccessfulCreate",
 		"Created job %s for CronJob %s", job.Name, klog.KObj(cronJob))

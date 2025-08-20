@@ -1,3 +1,18 @@
+/*
+Copyright The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 package cronjob
 
 import (
@@ -17,8 +32,6 @@ import (
 	batchv1 "volcano.sh/apis/pkg/apis/batch/v1alpha1"
 	"volcano.sh/volcano/pkg/features"
 )
-
-// Utilities for dealing with Jobs and CronJobs and time.
 
 type missedSchedulesType int
 
@@ -41,7 +54,6 @@ func (e missedSchedulesType) String() string {
 	}
 }
 
-// fromK8S
 func formatSchedule(cj *batchv1.CronJob, recorder record.EventRecorder) string {
 	if strings.Contains(cj.Spec.Schedule, "TZ") {
 		if recorder != nil {
@@ -284,7 +296,6 @@ func (o byJobCreationTimestamp) Less(i, j int) bool {
 	return o[i].ObjectMeta.CreationTimestamp.Before(&o[j].ObjectMeta.CreationTimestamp)
 }
 
-// ours
 func deleteFromActiveList(cc *batchv1.CronJob, uid types.UID) {
 	if cc == nil || uid == "" || len(cc.Status.Active) == 0 {
 		return
@@ -303,4 +314,17 @@ func deleteFromActiveList(cc *batchv1.CronJob, uid types.UID) {
 	if newLen < originalLen {
 		cc.Status.Active = active[:newLen:newLen]
 	}
+}
+func (cc *cronjobcontroller) validateTZandSchedule(cj *batchv1.CronJob, recorder record.EventRecorder) (cron.Schedule, error) {
+	if cj.Spec.TimeZone != nil {
+		timeZone := ptr.Deref(cj.Spec.TimeZone, "")
+		if _, err := time.LoadLocation(timeZone); err != nil {
+			klog.Errorf("Invalid time zone %q in CronJob %s: %v", timeZone, klog.KObj(cj), err)
+			recorder.Eventf(cj, corev1.EventTypeWarning, "InvalidTimeZone",
+				"Invalid time zone %q: %v", timeZone, err)
+			return nil, err
+		}
+	}
+	sch, err := cron.ParseStandard(formatSchedule(cj, recorder))
+	return sch, err
 }
