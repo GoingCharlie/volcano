@@ -38,7 +38,7 @@ var _ = Describe("CronJob E2E Test", func() {
 		}, 3*time.Minute, 10*time.Second).Should(BeTrue())
 
 		Eventually(func() int {
-			jobs, err := getJobList(ctx, cronJob)
+			jobs, err := getJobList(ctx, createdCronJob)
 			if err != nil {
 				return 0
 			}
