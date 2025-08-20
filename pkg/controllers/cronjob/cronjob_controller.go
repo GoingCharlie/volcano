@@ -63,7 +63,6 @@ type cronjobcontroller struct {
 func (cc *cronjobcontroller) Name() string { return "cronjob-controller" }
 
 func (cc *cronjobcontroller) Initialize(opt *framework.ControllerOption) error {
-	// vcscheme.AddToScheme(runtime.NewScheme())
 	cc.kubeClient = opt.KubeClient
 	cc.vcClient = opt.VolcanoClient
 	cc.cronjobClient = &realCronjobClient{}
@@ -114,7 +113,7 @@ func (cc *cronjobcontroller) Initialize(opt *framework.ControllerOption) error {
 	return nil
 }
 
-// Run start JobController.
+// Run start CronJobController.
 func (cc *cronjobcontroller) Run(stopCh <-chan struct{}) {
 	cc.vcInformerFactory.Start(stopCh)
 	for informerType, ok := range cc.vcInformerFactory.WaitForCacheSync(stopCh) {
@@ -183,7 +182,7 @@ func (cc *cronjobcontroller) sync(cronJobKey string) (*time.Duration, error) {
 	if err != nil {
 		return nil, err
 	}
-	//core process the cronjob
+	//sync cronjob
 	requeueAfter, updateStatus, syncErr := cc.syncCronJob(cronJob, jobsByCronJob)
 	if syncErr != nil {
 		klog.Errorf("Error syncing cronjob %s: %v", cronJobKey, syncErr)
@@ -207,14 +206,14 @@ func (cc *cronjobcontroller) syncCronJob(cronJob *batchv1.CronJob, jobsByCronJob
 	statusAfterProcessFi := cc.processFinishedJobs(cronJob, jobsByCronJob)
 
 	// process the controller jobs and active jobs
-	statusAfterProcessJobs, err := cc.processCtljobAndActiveJob(cronJob, jobsByCronJob)
+	statusAfterProcessJobs, err := cc.processCtlJobAndActiveJob(cronJob, jobsByCronJob)
 
 	updateStatus = statusAfterProcessFi || statusAfterProcessJobs
 	if err != nil {
 		klog.V(2).Info("Error reconciling cronjob", "cronjob", klog.KObj(cronJob), "err", err)
 		return nil, updateStatus, err
 	}
-	// If the cronjob is suspended, we do not create new jobs.
+	// If the cronjob is suspended, do not create new jobs.
 	if cronJob.Spec.Suspend != nil && *cronJob.Spec.Suspend {
 		klog.V(4).Info("Not starting job because the cron is suspended", "cronjob", klog.KObj(cronJob))
 		return nil, updateStatus, nil
@@ -234,24 +233,13 @@ func (cc *cronjobcontroller) syncCronJob(cronJob *batchv1.CronJob, jobsByCronJob
 		cc.recorder.Eventf(cronJob, v1.EventTypeWarning, "InvalidSchedule", "Error getting schedule time: %v", err)
 		return nil, updateStatus, err
 	}
-	// If there is no unmet start times, we skip job creation.
+	// If there is no unmet start times, skip job creation.
 	if scheduledTime == nil {
 		klog.V(2).Info("No unmet start times, skipping job creation",
 			"cronjob", klog.KObj(cronJob))
 		t := nextScheduleTimeDuration(cronJob, now, sch)
 		return t, updateStatus, nil
 	}
-
-	// If the cronjob has a starting deadline, check if the scheduled time is after the deadline.
-	// if cronJob.Spec.StartingDeadlineSeconds != nil {
-	// 	if now.After(scheduledTime.Add(time.Duration(*cronJob.Spec.StartingDeadlineSeconds) * time.Second)) {
-	// 		klog.V(2).Info("Missed job creation because the starting deadline has passed",
-	// 			"cronjob", klog.KObj(cronJob), "scheduledTime", scheduledTime)
-	// 		cc.recorder.Eventf(cronJob, v1.EventTypeWarning, "StartingDeadlineExceeded", "Missed job creation because the starting deadline has passed: %v", *cronJob.Spec.StartingDeadlineSeconds)
-	// 		t := nextScheduleTimeDuration(cronJob, now, sch)
-	// 		return t, updateStatus, nil
-	// 	}
-	// }
 
 	// check if the scheduled time is already processed.
 	if inActiveListByName(cronJob, &batchv1.Job{
