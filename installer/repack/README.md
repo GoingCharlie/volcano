@@ -58,7 +58,7 @@ kubectl apply -f installer/repack/repack-engine.yaml
 ```
 
 The engine mounts `volcano-scheduler-configmap` for `--scheduler-conf`, so it sees
-the cluster exactly as the scheduler does. Its own Action and Plugin pipeline is
+the cluster exactly as the scheduler does. Adjust `--repack-eviction-retry-timeout` as needed. Its own Action and Plugin pipeline is
 defined separately in `repack-engine.conf` and loaded with `--repack-conf`.
 `actions` follows the scheduler syntax (`actions: "repack"`; multiple Actions are
 comma-separated). Command-line `--repack-actions` and `--repack-plugins` values

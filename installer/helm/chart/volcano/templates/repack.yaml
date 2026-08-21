@@ -191,6 +191,7 @@ spec:
             {{- if .Values.custom.repack_plugins }}
             - --repack-plugins={{ join "," .Values.custom.repack_plugins }}
             {{- end }}
+            - --repack-eviction-retry-timeout={{ .Values.custom.repack_eviction_retry_timeout | default "10m" }}
             - --enable-healthz=true
             - --healthz-address=:11251
             - --enable-metrics=true

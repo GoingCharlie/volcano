@@ -136,6 +136,9 @@ spec:
             - --resync-period=5m
             # default accelerator when a RepackRun's spec.goals is empty:
             - --repack-default-resource=nvidia.com/gpu
+            # how long PDB-blocked evictions may keep being retried before the
+            # remaining victims are marked Rejected:
+            - --repack-eviction-retry-timeout=10m
             - -v=3
           volumeMounts:
             - name: scheduler-config

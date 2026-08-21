@@ -51,6 +51,9 @@ custom:
   # action requires at least one domain provider (currently nodeconsolidation).
   # Example: [workloadscope, repackbudget, nodeconsolidation, workloaddisruption, gangdisruption, binpack]
   repack_plugins: []
+  # how long an Execute may keep retrying PDB-blocked evictions before the
+  # remaining victims are marked Rejected
+  repack_eviction_retry_timeout: "10m"
   repack_log_level: 3
   scheduler_metrics_enable: true
   scheduler_pprof_enable: false
