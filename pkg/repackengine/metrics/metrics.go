@@ -85,6 +85,30 @@ var (
 		Name:      "planner_candidates_pruned_total",
 		Help:      "Number of drain candidates rejected by planning stage and bounded reason.",
 	}, []string{"mode", "reason"})
+
+	// EvictionAttemptsTotal counts every Eviction API attempt by classification.
+	// A retryable Pod may accumulate multiple attempts.
+	EvictionAttemptsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Subsystem: subsystem,
+		Name:      "eviction_attempts_total",
+		Help:      "Number of Eviction API attempts during Execute, by result (accepted/too_many_requests/transient_error/permanent_error/victim_gone).",
+	}, []string{"result"})
+
+	// EvictionWavesTotal counts eviction waves by outcome (complete/partial/blocked).
+	EvictionWavesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Subsystem: subsystem,
+		Name:      "eviction_waves_total",
+		Help:      "Number of eviction waves by outcome (complete/partial/blocked).",
+	}, []string{"outcome"})
+
+	// EvictionRetryDelaySeconds observes the backoff scheduled after a retryable
+	// eviction.
+	EvictionRetryDelaySeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+		Subsystem: subsystem,
+		Name:      "eviction_retry_delay_seconds",
+		Help:      "Backoff delay scheduled after a retryable eviction.",
+		Buckets:   []float64{0.5, 1, 2, 4, 8, 16, 32, 64},
+	})
 )
 
 // ObserveRun records a finished run's mode+outcome.
@@ -127,3 +151,12 @@ func ObservePlanner(mode string, candidatesEvaluated, feasibilitySimulations int
 		}
 	}
 }
+
+// ObserveEvictionAttempt records one Eviction API attempt by classification.
+func ObserveEvictionAttempt(result string) { EvictionAttemptsTotal.WithLabelValues(result).Inc() }
+
+// ObserveEvictionWave records one eviction wave by outcome.
+func ObserveEvictionWave(outcome string) { EvictionWavesTotal.WithLabelValues(outcome).Inc() }
+
+// ObserveEvictionRetryDelay records the backoff scheduled for one retry.
+func ObserveEvictionRetryDelay(seconds float64) { EvictionRetryDelaySeconds.Observe(seconds) }

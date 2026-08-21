@@ -488,7 +488,9 @@ func TestExpirePlacementsIncludesNominatedReplacement(t *testing.T) {
 		Status: repackv1alpha1.RepackRunStatus{
 			Phase: repackv1alpha1.RepackRunning,
 			Relocations: []repackv1alpha1.PodRelocationStatus{{
-				Namespace: "ns", PodGroupName: "pg", VictimPodName: "victim", PlannedNodeName: "n2", Placement: repackv1alpha1.PodPlacementStatus{SelectedNodeName: "n2", ReplacementPodName: "replacement", ReplacementPodUID: "replacement-uid",
+				Namespace: "ns", PodGroupName: "pg", VictimPodName: "victim", PlannedNodeName: "n2",
+				Eviction: repackv1alpha1.PodEvictionStatus{Phase: repackv1alpha1.PodEvictionAccepted},
+				Placement: repackv1alpha1.PodPlacementStatus{SelectedNodeName: "n2", ReplacementPodName: "replacement", ReplacementPodUID: "replacement-uid",
 					ExpirationTime: &deadline, Phase: repackv1alpha1.PodPlacementNominated},
 			}},
 		},
@@ -520,7 +522,9 @@ func TestExpirePlacementsDoesNotOverwriteConcurrentPlacementResult(t *testing.T)
 	staleRun := &repackv1alpha1.RepackRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "run", UID: types.UID("run-uid")},
 		Status: repackv1alpha1.RepackRunStatus{Relocations: []repackv1alpha1.PodRelocationStatus{{
-			Namespace: "ns", PodGroupName: "pg", VictimPodName: "victim", PlannedNodeName: "n2", Placement: repackv1alpha1.PodPlacementStatus{ExpirationTime: &deadline, Phase: repackv1alpha1.PodPlacementNominated},
+			Namespace: "ns", PodGroupName: "pg", VictimPodName: "victim", PlannedNodeName: "n2",
+			Eviction:  repackv1alpha1.PodEvictionStatus{Phase: repackv1alpha1.PodEvictionAccepted},
+			Placement: repackv1alpha1.PodPlacementStatus{ExpirationTime: &deadline, Phase: repackv1alpha1.PodPlacementNominated},
 		}},
 		},
 	}
@@ -578,6 +582,7 @@ func TestUpdateActualExecuteResult(t *testing.T) {
 		Result: &repackv1alpha1.RepackResult{MovedCardCount: 2},
 		Relocations: []repackv1alpha1.PodRelocationStatus{{
 			Namespace: "ns", PodGroupName: "pg", VictimPodName: "victim", PlannedNodeName: "receiver",
+			Eviction: repackv1alpha1.PodEvictionStatus{Phase: repackv1alpha1.PodEvictionAccepted},
 		}},
 	}}
 	updateActualExecuteResult(run, nodes, resource)

@@ -786,8 +786,67 @@ func (n *Nominator) hasPotentialNominationForPod(
 	if len(sourcePodGroups) == 0 {
 		return false, nil
 	}
-	return hasClaimableNominationForSourcePodGroups(
+	if hasClaimableNominationForSourcePodGroups(
+		run, pod.Namespace, sourcePodGroups, candidateSchedulingRequirementsHash, now) {
+		return true, nil
+	}
+	// The replacement Pod can race ahead of the engine's durable transition: a
+	// workload controller recreates the Pod the moment the eviction is accepted,
+	// which may be before the engine has persisted Eviction=Accepted (and thus
+	// before the intent becomes "claimable"). Such a Pod is still unambiguously
+	// a candidate — it lives in a source PodGroup leased by this Run. Keep it
+	// gated and retry rather than releasing the gate, so the placement protocol
+	// survives the transient instead of letting the replacement schedule freely.
+	return hasPotentialSourceNomination(
 		run, pod.Namespace, sourcePodGroups, candidateSchedulingRequirementsHash, now), nil
+}
+
+// hasPotentialSourceNomination reports whether any relocation for the given
+// source PodGroups still has unfinished eviction work that a pending replacement
+// Pod could claim — including the transient InProgress state, which the strict
+// claimable check treats as not-yet-available.
+func hasPotentialSourceNomination(
+	run *repackv1alpha1.RepackRun,
+	namespace string,
+	sourcePodGroups []string,
+	candidateSchedulingRequirementsHash string,
+	now time.Time,
+) bool {
+	if !placementRunActive(run) {
+		return false
+	}
+	names := make(map[string]struct{}, len(sourcePodGroups))
+	for _, name := range sourcePodGroups {
+		names[name] = struct{}{}
+	}
+	for index := range run.Status.Relocations {
+		nomination := &run.Status.Relocations[index]
+		if nomination.Namespace != namespace {
+			continue
+		}
+		if _, found := names[nomination.PodGroupName]; !found {
+			continue
+		}
+		if nomination.Placement.ExpirationTime != nil && now.After(nomination.Placement.ExpirationTime.Time) {
+			continue
+		}
+		if nomination.Placement.ReplacementPodName != "" || nomination.Placement.ReplacementPodUID != "" {
+			continue
+		}
+		switch nomination.Placement.Phase {
+		case repackv1alpha1.PodPlacementPlaced, repackv1alpha1.PodPlacementTimedOut:
+			continue
+		}
+		switch nomination.Eviction.Phase {
+		case repackv1alpha1.PodEvictionInProgress, repackv1alpha1.PodEvictionAccepted,
+			repackv1alpha1.PodEvictionIndirectlyRemoved:
+			if nomination.SchedulingRequirementsHash == "" ||
+				nomination.SchedulingRequirementsHash == candidateSchedulingRequirementsHash {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func hasClaimableNominationForPodGroup(

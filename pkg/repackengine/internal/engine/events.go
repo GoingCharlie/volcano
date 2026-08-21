@@ -58,6 +58,9 @@ const (
 	eventReasonPlacementLeaseRepaired  = "PlacementLeaseRepaired"
 	eventReasonWaitingForNodeSelection = "WaitingForNodeSelection"
 	eventReasonPlacementTimedOut       = "PlacementTimedOut"
+	eventReasonEvictionBlocked         = "EvictionBlocked"
+	eventReasonEvictionUnblocked       = "EvictionUnblocked"
+	eventReasonEvictionRetryTimedOut   = "EvictionRetryTimedOut"
 )
 
 func (e *Engine) recordRunEvent(run *repackv1alpha1.RepackRun, eventType, reason, message string) {

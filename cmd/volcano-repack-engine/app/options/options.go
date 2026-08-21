@@ -41,7 +41,10 @@ const (
 	// defaultExecuteCooldown in sync with the controller's GC cooldown floor.
 	defaultExecuteCooldown = 10 * time.Minute
 	defaultNominationTTL   = 10 * time.Minute
-	defaultResyncPeriod    = 10 * time.Minute
+	// defaultEvictionRetryTimeout bounds how long PDB-blocked evictions may keep
+	// being retried before the remaining victims are marked Rejected.
+	defaultEvictionRetryTimeout = 10 * time.Minute
+	defaultResyncPeriod         = 10 * time.Minute
 )
 
 // ServerOption holds the volcano-repack-engine configuration.
@@ -64,6 +67,9 @@ type ServerOption struct {
 	DefaultResource string
 	NominationTTL   time.Duration
 	Cooldown        time.Duration
+	// EvictionRetryTimeout bounds how long PDB-blocked evictions may keep being
+	// retried before the remaining victims are marked Rejected.
+	EvictionRetryTimeout time.Duration
 
 	LeaderElection      componentbaseconfig.LeaderElectionConfiguration
 	LockObjectNamespace string
@@ -103,6 +109,8 @@ func (s *ServerOption) AddFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&s.MinNodesFreed, "repack-min-nodes-freed", 0, "Benefit gate: minimum whole nodes a plan must free (0 = engine default 1)")
 	fs.StringVar(&s.DefaultResource, "repack-default-resource", "", "Target resource when a RepackRun's spec.goals is empty (e.g. nvidia.com/gpu)")
 	fs.DurationVar(&s.NominationTTL, "repack-nomination-ttl", defaultNominationTTL, "How long an Execute nomination is re-asserted onto the replacement pod before expiring")
+	fs.DurationVar(&s.EvictionRetryTimeout, "repack-eviction-retry-timeout", defaultEvictionRetryTimeout,
+		"How long an Execute may keep retrying PDB-blocked evictions before the remaining victims are marked Rejected")
 
 	fs.BoolVar(&s.EnableHealthz, "enable-healthz", false, "Enable the /healthz liveness endpoint (false by default)")
 	fs.StringVar(&s.HealthzBindAddress, "healthz-address", defaultHealthzAddress, "The address to listen on for the /healthz health-check server")

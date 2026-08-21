@@ -89,15 +89,16 @@ func Run(opt *options.ServerOption) error {
 	}
 
 	engine, err := repackengine.NewEngine(config, repackengine.Config{
-		SchedulerConf:   opt.SchedulerConf,
-		RepackConf:      opt.RepackConf,
-		ResyncPeriod:    opt.ResyncPeriod,
-		Cooldown:        opt.Cooldown,
-		Actions:         opt.Actions,
-		Plugins:         repackengine.PluginOptions(opt.Plugins),
-		MinNodesFreed:   opt.MinNodesFreed,
-		DefaultResource: opt.DefaultResource,
-		NominationTTL:   opt.NominationTTL,
+		SchedulerConf:        opt.SchedulerConf,
+		RepackConf:           opt.RepackConf,
+		ResyncPeriod:         opt.ResyncPeriod,
+		Cooldown:             opt.Cooldown,
+		Actions:              opt.Actions,
+		Plugins:              repackengine.PluginOptions(opt.Plugins),
+		MinNodesFreed:        opt.MinNodesFreed,
+		DefaultResource:      opt.DefaultResource,
+		NominationTTL:        opt.NominationTTL,
+		EvictionRetryTimeout: opt.EvictionRetryTimeout,
 	})
 	if err != nil {
 		return err
