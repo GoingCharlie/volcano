@@ -1116,6 +1116,20 @@ func waitPodGroupDeleted(ctx *e2eutil.TestContext, namespace, podGroupName strin
 }
 
 func prepareGatedPlacement(ctx *e2eutil.TestContext, name, plannedNode string, freedNodes []string, deadline time.Duration) (*repackv1alpha1.RepackRun, string, *v1.Pod) {
+	return prepareGatedPlacementWithOptions(ctx, name, plannedNode, freedNodes, deadline, nil)
+}
+
+// prepareGatedPlacementUnschedulable is like prepareGatedPlacement but makes the
+// replacement Pod structurally impossible to host: its nodeSelector selects a
+// node that does not exist, so no receiver is ever feasible regardless of cluster
+// state or cache timing. It proves the engine keeps the committed placement
+// pending, does not expand eviction, and fails the Run at the placement deadline.
+func prepareGatedPlacementUnschedulable(ctx *e2eutil.TestContext, name, plannedNode string, freedNodes []string, deadline time.Duration) (*repackv1alpha1.RepackRun, string, *v1.Pod) {
+	return prepareGatedPlacementWithOptions(ctx, name, plannedNode, freedNodes, deadline,
+		map[string]string{"kubernetes.io/hostname": "repack-unschedulable-receiver"})
+}
+
+func prepareGatedPlacementWithOptions(ctx *e2eutil.TestContext, name, plannedNode string, freedNodes []string, deadline time.Duration, nodeSelector map[string]string) (*repackv1alpha1.RepackRun, string, *v1.Pod) {
 	run, err := newRun(name, repackv1alpha1.RepackModeExecute).goal(npuResource).create(ctx)
 	Expect(err).NotTo(HaveOccurred())
 	pgName := fmt.Sprintf("%s-pg", run.Name)
@@ -1163,9 +1177,10 @@ func prepareGatedPlacement(ctx *e2eutil.TestContext, name, plannedNode string, f
 	resources := v1.ResourceList{npuResource: quantity}
 	pod := e2eutil.CreatePod(ctx, e2eutil.PodSpec{
 		Name: podName, SchedulerName: e2eutil.SchedulerName, RestartPolicy: v1.RestartPolicyNever,
-		Req:         resources,
-		Limit:       resources,
-		Annotations: map[string]string{"scheduling.k8s.io/group-name": pgName},
+		Req:          resources,
+		Limit:        resources,
+		NodeSelector: nodeSelector,
+		Annotations:  map[string]string{"scheduling.k8s.io/group-name": pgName},
 	})
 	return run, pgName, pod
 }

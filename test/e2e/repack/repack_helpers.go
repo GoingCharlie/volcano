@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -259,6 +260,71 @@ func occupyNativeDeployment(ctx *e2eutil.TestContext, name, node, scopeValue str
 		podName:    initialPod.Name,
 		podUID:     initialPod.UID,
 		podGroup:   initialPod.Annotations["scheduling.k8s.io/group-name"],
+	}
+}
+
+// occupyNativeDeploymentReplicas creates a multi-replica Deployment on a
+// deterministic node (other workers temporarily tainted during the initial
+// scheduling decision). All replicas share the workload labels, so the Repack
+// plan (scoped to repack-e2e-scope=move) treats the whole Deployment as one
+// gang while its owner implements the scale subresource — which lets a PDB on
+// it compute DisruptionsAllowed correctly (unlike a volcano Job).
+func occupyNativeDeploymentReplicas(ctx *e2eutil.TestContext, name, node, scopeValue string, cards int, replicas int32) *nativeWorkload {
+	releaseNodes := holdNonTargetNodes(ctx, node)
+	defer releaseNodes()
+
+	labels := map[string]string{
+		nativeWorkloadLabel: name,
+		nativeScopeLabel:    scopeValue,
+	}
+	quantity := resource.MustParse(fmt.Sprintf("%d", cards))
+	deployment, err := ctx.Kubeclient.AppsV1().Deployments(ctx.Namespace).Create(context.TODO(), &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ctx.Namespace},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{nativeWorkloadLabel: name}},
+			Template: v1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				Spec: v1.PodSpec{
+					SchedulerName: e2eutil.SchedulerName,
+					RestartPolicy: v1.RestartPolicyAlways,
+					Containers: []v1.Container{{
+						Name:            name,
+						Image:           e2eutil.DefaultNginxImage,
+						ImagePullPolicy: v1.PullIfNotPresent,
+						Resources:       v1.ResourceRequirements{Requests: v1.ResourceList{npuResource: quantity}, Limits: v1.ResourceList{npuResource: quantity}},
+					}},
+				},
+			},
+		},
+	}, metav1.CreateOptions{})
+	Expect(err).NotTo(HaveOccurred(), "create native deployment")
+
+	var first *v1.Pod
+	Eventually(func() bool {
+		pods, listErr := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).List(context.TODO(), metav1.ListOptions{
+			LabelSelector: nativeWorkloadLabel + "=" + name,
+		})
+		if listErr != nil || int32(len(pods.Items)) != replicas {
+			return false
+		}
+		for i := range pods.Items {
+			pod := &pods.Items[i]
+			if pod.Annotations["scheduling.k8s.io/group-name"] == "" || pod.Spec.NodeName != node || pod.Status.Phase != v1.PodRunning {
+				return false
+			}
+			if first == nil {
+				first = pod.DeepCopy()
+			}
+		}
+		return true
+	}, fixtureTimeout, repackPoll).Should(BeTrue(), "all native replicas must run on the deterministic fixture node with automatic PodGroups")
+
+	return &nativeWorkload{
+		deployment: deployment,
+		podName:    first.Name,
+		podUID:     first.UID,
+		podGroup:   first.Annotations["scheduling.k8s.io/group-name"],
 	}
 }
 
@@ -699,4 +765,129 @@ func runningPodCount(ctx *e2eutil.TestContext) int {
 		}
 	}
 	return n
+}
+
+// withEvictionRetryTimeout patches the repack-engine deployment to a short
+// --repack-eviction-retry-timeout (the PDB-eviction retry deadline) so the
+// PDB-retry e2e cases can observe the deadline-based terminal within the test
+// window. It also shortens --repack-nomination-ttl (the replacement placement
+// deadline) to 2x the retry timeout: after the last retryable victim is
+// rejected, the engine waits for the planned node-freeing observation to
+// converge only until the placement deadline, so without this the run would
+// linger for the default 10m before reporting BenefitNotRealized. A rolling
+// restart is required for the new flags to take effect, so the helper (and its
+// returned cleanup) both wait for the deployment to become available again.
+func withEvictionRetryTimeout(ctx *e2eutil.TestContext, timeout time.Duration) func() {
+	deployments, err := ctx.Kubeclient.AppsV1().Deployments(repackSystemNamespace).List(
+		context.TODO(), metav1.ListOptions{LabelSelector: "app=volcano-repack-engine"})
+	Expect(err).NotTo(HaveOccurred(), "list repack engine deployments")
+	Expect(deployments.Items).To(HaveLen(1), "exactly one repack engine deployment must exist")
+	deployment := deployments.Items[0].DeepCopy()
+	name := deployment.Name
+	originalArgs := append([]string(nil), deployment.Spec.Template.Spec.Containers[0].Args...)
+
+	args := deployment.Spec.Template.Spec.Containers[0].Args
+	args = setOrAppendFlag(args, "--repack-eviction-retry-timeout", fmt.Sprintf("%s", timeout))
+	args = setOrAppendFlag(args, "--repack-nomination-ttl", fmt.Sprintf("%s", 2*timeout))
+	deployment.Spec.Template.Spec.Containers[0].Args = args
+	_, err = ctx.Kubeclient.AppsV1().Deployments(repackSystemNamespace).Update(context.TODO(), deployment, metav1.UpdateOptions{})
+	Expect(err).NotTo(HaveOccurred(), "patch repack engine eviction retry timeout")
+	waitForRepackEngineRollout(ctx, name)
+
+	restored := false
+	return func() {
+		if restored {
+			return
+		}
+		restored = true
+		current, getErr := ctx.Kubeclient.AppsV1().Deployments(repackSystemNamespace).Get(context.TODO(), name, metav1.GetOptions{})
+		Expect(getErr).NotTo(HaveOccurred())
+		current.Spec.Template.Spec.Containers[0].Args = originalArgs
+		_, updateErr := ctx.Kubeclient.AppsV1().Deployments(repackSystemNamespace).Update(context.TODO(), current, metav1.UpdateOptions{})
+		Expect(updateErr).NotTo(HaveOccurred(), "restore repack engine eviction retry timeout")
+		waitForRepackEngineRollout(ctx, name)
+	}
+}
+
+// setOrAppendFlag replaces an existing "--name=value" argument or appends it.
+func setOrAppendFlag(args []string, name, value string) []string {
+	flag := name + "=" + value
+	for i, arg := range args {
+		if strings.HasPrefix(arg, name+"=") {
+			args[i] = flag
+			return args
+		}
+	}
+	return append(args, flag)
+}
+
+// waitForRepackEngineRollout blocks until the deployment's replicas are all
+// updated and available (the new engine process is serving).
+func waitForRepackEngineRollout(ctx *e2eutil.TestContext, name string) {
+	Eventually(func() bool {
+		d, err := ctx.Kubeclient.AppsV1().Deployments(repackSystemNamespace).Get(context.TODO(), name, metav1.GetOptions{})
+		if err != nil {
+			return false
+		}
+		replicas := int32(1)
+		if d.Spec.Replicas != nil {
+			replicas = *d.Spec.Replicas
+		}
+		return d.Status.ObservedGeneration >= d.Generation &&
+			d.Status.UpdatedReplicas >= replicas &&
+			d.Status.AvailableReplicas >= replicas
+	}, repackTimeout, repackPoll).Should(BeTrue(), "repack engine deployment %s must finish rolling out", name)
+}
+
+// runningPodsForJob returns the Running Pods of a vcjob (selected by
+// volcano.sh/job-name), sorted by name.
+func runningPodsForJob(ctx *e2eutil.TestContext, job *batchv1alpha1.Job) []v1.Pod {
+	pods, err := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).List(context.TODO(), metav1.ListOptions{
+		LabelSelector: "volcano.sh/job-name=" + job.Name,
+	})
+	Expect(err).NotTo(HaveOccurred())
+	var running []v1.Pod
+	for i := range pods.Items {
+		pod := pods.Items[i]
+		if pod.Status.Phase == v1.PodRunning {
+			running = append(running, pod)
+		}
+	}
+	sort.Slice(running, func(i, j int) bool { return running[i].Name < running[j].Name })
+	return running
+}
+
+// runningNativePods returns the Running Pods of a native workload (selected by
+// nativeWorkloadLabel), sorted by name.
+func runningNativePods(ctx *e2eutil.TestContext, name string) []v1.Pod {
+	pods, err := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).List(context.TODO(), metav1.ListOptions{
+		LabelSelector: nativeWorkloadLabel + "=" + name,
+	})
+	Expect(err).NotTo(HaveOccurred())
+	var running []v1.Pod
+	for i := range pods.Items {
+		pod := pods.Items[i]
+		if pod.Status.Phase == v1.PodRunning {
+			running = append(running, pod)
+		}
+	}
+	sort.Slice(running, func(i, j int) bool { return running[i].Name < running[j].Name })
+	return running
+}
+
+// podStillRunningWithUID reports whether a Pod with the given UID still exists
+// and is Running — used to prove a victim was never evicted (PDB not bypassed)
+// or that an engine restart did not double-evict a replacement.
+func podStillRunningWithUID(ctx *e2eutil.TestContext, namespace string, podUID types.UID) bool {
+	pods, err := ctx.Kubeclient.CoreV1().Pods(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return false
+	}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.UID == podUID && pod.Status.Phase == v1.PodRunning {
+			return true
+		}
+	}
+	return false
 }
