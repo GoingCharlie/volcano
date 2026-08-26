@@ -142,8 +142,13 @@ func (e *Engine) executePreparedEvictionsWithClient(
 
 	wave := e.collectEvictionWave(run)
 	if len(wave) == 0 {
-		// No victim is due: either everything is in backoff (schedule the next
-		// retry) or the retry deadline has passed (finalize below).
+		// No victim is due. Either everything is in backoff (schedule the next
+		// retry), the retry deadline has passed, or every victim already reached
+		// a final eviction outcome. In the latter two cases route to finalization
+		// so the Run terminates instead of requeueing forever.
+		if e.retryDeadlinePassed(run) || !hasUnfinishedEvictions(run) {
+			return e.finalizeEvictions(ctx, run, generation, targetResource)
+		}
 		return e.scheduleEvictionRetry(run)
 	}
 	klog.V(4).InfoS("repack: eviction wave collected",

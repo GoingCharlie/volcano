@@ -59,6 +59,15 @@ func (e *Engine) reconcilePlacement(ctx context.Context, run *repackv1alpha1.Rep
 		return engineframework.RuntimeResult{Requeue: true}
 	}
 	if placementexecutor.Complete(run) {
+		// A committed replacement that timed out stops eviction entirely: no
+		// further victims are issued so the Run finalizes with a precise
+		// placement-timeout outcome instead of expanding disturbance.
+		if committedPlacementTimedOut(run) {
+			if err := e.stopEvictionsOnPlacementTimeout(ctx, run); err != nil {
+				return runtimeError(err)
+			}
+			return e.finishPlacement(ctx, run)
+		}
 		// The committed (eviction-accepted) subset has finished replacement
 		// placement. If PDB-blocked siblings are still retrying and the eviction
 		// retry deadline has not passed, clear the ReconcilingPlacements condition
