@@ -508,32 +508,46 @@ func (e *Engine) scheduleEvictionRetry(run *repackv1alpha1.RepackRun) enginefram
 	return engineframework.RuntimeResult{Requeue: true}
 }
 
-// finalizeEvictions routes a fully-final eviction journal: reject the
-// unfinished subset when the retry deadline passed, otherwise retain the
-// accepted subset and route to replacement placement, or fail with a precise
-// outcome when nothing was moved.
+// finalizeEvictions routes a fully-final eviction journal to its terminal
+// outcome. If the retry deadline passed (or a committed replacement timed out)
+// the unfinished subset is rejected first; then, when nothing was committed,
+// the Run fails EvictionFailed with a seeded observed result, otherwise the
+// successful subset is retained and routed to terminal placement verification.
 func (e *Engine) finalizeEvictions(
 	ctx context.Context,
 	run *repackv1alpha1.RepackRun,
 	generation int64,
 	targetResource v1.ResourceName,
 ) engineframework.RuntimeResult {
-	if e.retryDeadlinePassed(run) {
-		if err := e.markEvictionsRetryTimedOut(ctx, run); err != nil {
-			return runtimeError(err)
+	// Reject the unfinished subset on the retry deadline, or when a committed
+	// replacement timed out (stop expanding disturbance).
+	if hasUnfinishedEvictions(run) {
+		switch {
+		case e.retryDeadlinePassed(run):
+			if err := e.markEvictionsRetryTimedOut(ctx, run); err != nil {
+				return runtimeError(err)
+			}
+		case committedPlacementTimedOut(run):
+			if err := e.stopEvictionsOnPlacementTimeout(ctx, run); err != nil {
+				return runtimeError(err)
+			}
 		}
 	}
-	summary := summarizeEvictions(run.Status.Relocations)
-	plannedVictimCount := plannedVictimCount(run)
-	if classifiedCount := summary.accepted + summary.indirectlyRemoved + summary.rejected; classifiedCount < plannedVictimCount {
-		summary.rejected += plannedVictimCount - classifiedCount
+	if hasUnfinishedEvictions(run) {
+		return runtimeError(fmt.Errorf("finalize %s while evictions remain unfinished", run.Name))
 	}
-	if summary.accepted == 0 && summary.indirectlyRemoved == 0 {
+	if !hasCommittedRelocations(run) {
+		// Seed an observed Execute result (nothing moved) so operators still
+		// see FragAfter/FreedNodeCount/MetricsVerified=false.
+		initializeExecuteResultFromStatus(run)
+		summary := summarizeEvictions(run.Status.Relocations)
 		e.observeEvictionSummary(run, summary)
 		return runtimeError(e.fail(ctx, run, generation, state.ReasonEvictionFailed,
-			fmt.Errorf("all %d planned evictions were rejected; no Pods were moved", summary.rejected)))
+			fmt.Errorf("all %d planned evictions were rejected or timed out; no Pods were moved", summary.rejected)))
 	}
-	// An accepted subset exists: route to replacement placement.
+	// Retain only the committed subset, seed the result with just those moves,
+	// and route to replacement placement for terminal verification.
+	retainSuccessfulRelocations(run)
 	initializeExecuteResultFromStatus(run)
 	message := enginestatus.PlacementProgressMessage(run, targetResource)
 	state.MarkRunning(run, state.ReasonReconcilingPlacements, message)
@@ -541,7 +555,6 @@ func (e *Engine) finalizeEvictions(
 		return runtimeError(fmt.Errorf("persist awaiting placement status: %w", err))
 	}
 	e.recordRunEvent(run, v1.EventTypeNormal, eventReasonReconcilingPlacements, message)
-	e.observeEvictionSummary(run, summary)
 	return engineframework.RuntimeResult{Requeue: true}
 }
 
