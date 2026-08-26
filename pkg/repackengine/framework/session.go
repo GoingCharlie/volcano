@@ -76,6 +76,11 @@ type Session struct {
 	victimOrderFns        []namedVictimOrder
 	receiverPreferenceFns []namedReceiverPreference
 
+	// pdbConsultant answers per-PodGroup PDB disruption allowance at planning
+	// time. Set by the engine before plugins open; nil means "no PDB opinion"
+	// (noop) so planning never vetoes on PDB unless a consultant is wired in.
+	pdbConsultant api.PDBConsultant
+
 	// results filled by the action, read by the Engine runtime
 	plan   *api.RepackPlan
 	report api.Report
@@ -159,6 +164,23 @@ func (s *Session) MaxResource() int64              { return s.configuration.MaxR
 func (s *Session) LimitPodGroups() bool            { return s.configuration.LimitPodGroups }
 func (s *Session) LimitResource() bool             { return s.configuration.LimitResource }
 
+// SetPDBConsultant wires the PDB disruption-allowance source into the Session.
+// The engine calls this before plugins open (or plugins may set a test fake).
+func (s *Session) SetPDBConsultant(c api.PDBConsultant) {
+	if c != nil {
+		s.pdbConsultant = c
+	}
+}
+
+// PDBConsultant returns the configured consultant, or a noop that never vetoes
+// (a nil consultant must not change planning behavior).
+func (s *Session) PDBConsultant() api.PDBConsultant {
+	if s.pdbConsultant == nil {
+		return noopPDBConsultant{}
+	}
+	return s.pdbConsultant
+}
+
 // ---- aggregate consumption (called by actions/planners) ----
 
 // Nodes returns the snapshot's candidate nodes.
@@ -196,6 +218,14 @@ func (s *Session) FreeableUnits() []api.FreeableUnit {
 // PlanContext builds the scoring context from the snapshot and target resource.
 func (s *Session) PlanContext() *api.PlanContext {
 	return &api.PlanContext{TargetResource: s.configuration.Resource, PodGroupViews: s.configuration.Snapshot}
+}
+
+// noopPDBConsultant never vetoes: a Session without a wired PDB source behaves
+// exactly as before this feature existed (no planning-time PDB opinion).
+type noopPDBConsultant struct{}
+
+func (noopPDBConsultant) Evictable(*schedapi.TaskInfo) (bool, bool) {
+	return false, false
 }
 
 // ---- result (set by the action, read by the Engine runtime) ----

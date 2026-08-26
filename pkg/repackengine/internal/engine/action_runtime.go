@@ -93,6 +93,9 @@ func (r *actionRuntime) OpenPlanningCycle(ctx context.Context, run *repackv1alph
 		LimitPodGroups:            hasPodGroupLimit,
 		LimitResource:             hasResourceLimit,
 	}, e.config.Plugins)
+	// Wire the planning-time PDB consultant (pdbaware plugin) from the live
+	// scheduler session's informer factory. Nil (fake session) keeps the noop.
+	ssn.SetPDBConsultant(adapter.NewSessionPDBConsultant(schedulerSession))
 	closePlanning := func() {
 		engineframework.CloseSession(ssn)
 		closeCycle()
