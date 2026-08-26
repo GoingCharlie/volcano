@@ -38,6 +38,9 @@ type Config struct {
 	MinNodesFreed   int
 	DefaultResource string
 	NominationTTL   time.Duration
+	// EvictionRetryTimeout bounds how long an Execute may keep retrying
+	// PDB-blocked evictions before the remaining victims are marked Rejected.
+	EvictionRetryTimeout time.Duration
 }
 
 // FileConfiguration is the strict YAML representation of repack-engine.conf.
@@ -46,7 +49,12 @@ type FileConfiguration struct {
 	Plugins []framework.PluginOption `yaml:"plugins"`
 }
 
-const DefaultNominationTTL = 10 * time.Minute
+const (
+	DefaultNominationTTL = 10 * time.Minute
+	// DefaultEvictionRetryTimeout is how long an Execute may keep retrying
+	// PDB-blocked evictions before the remaining victims are marked Rejected.
+	DefaultEvictionRetryTimeout = 10 * time.Minute
+)
 
 // ApplyDefaults fills runtime defaults that are independent of command flags.
 func ApplyDefaults(config *Config) {
@@ -55,6 +63,9 @@ func ApplyDefaults(config *Config) {
 	}
 	if config.NominationTTL <= 0 {
 		config.NominationTTL = DefaultNominationTTL
+	}
+	if config.EvictionRetryTimeout <= 0 {
+		config.EvictionRetryTimeout = DefaultEvictionRetryTimeout
 	}
 }
 

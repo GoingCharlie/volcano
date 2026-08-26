@@ -59,6 +59,20 @@ func (e *Engine) reconcilePlacement(ctx context.Context, run *repackv1alpha1.Rep
 		return engineframework.RuntimeResult{Requeue: true}
 	}
 	if placementexecutor.Complete(run) {
+		// The committed (eviction-accepted) subset has finished replacement
+		// placement. If PDB-blocked siblings are still retrying and the eviction
+		// retry deadline has not passed, clear the ReconcilingPlacements condition
+		// and return to the Evicting stage so the accepted replacements first
+		// restore PDB allowance, then the blocked siblings are retried.
+		if hasUnfinishedEvictions(run) && !e.retryDeadlinePassed(run) {
+			message := "Accepted replacements placed; resuming eviction retries for PDB-blocked siblings."
+			state.MarkRunning(run, state.ReasonEvicting, message)
+			if err := e.updateStatus(ctx, run); err != nil {
+				return runtimeError(err)
+			}
+			e.recordRunEvent(run, v1.EventTypeNormal, eventReasonEvictionUnblocked, message)
+			return engineframework.RuntimeResult{Requeue: true}
+		}
 		return e.finishPlacement(ctx, run)
 	}
 	pending := placementexecutor.Candidates(run)

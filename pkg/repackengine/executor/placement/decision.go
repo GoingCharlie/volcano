@@ -88,18 +88,45 @@ func Receivers(nodes []*schedapi.NodeInfo, freedNodes []string, plannedNode stri
 	return receivers
 }
 
+// EvictionAllowsPlacement reports whether a relocation's eviction has been
+// committed (Accepted or IndirectlyRemoved) and replacement placement may
+// therefore proceed. PDB-blocked victims (Pending/InProgress/Rejected) are
+// deliberately excluded: their replacement must wait for eviction to complete,
+// and they must not block the accepted subset's placement.
+func EvictionAllowsPlacement(relocation *repackv1alpha1.PodRelocationStatus) bool {
+	if relocation == nil {
+		return false
+	}
+	switch relocation.Eviction.Phase {
+	case repackv1alpha1.PodEvictionAccepted, repackv1alpha1.PodEvictionIndirectlyRemoved:
+		return true
+	default:
+		return false
+	}
+}
+
+// Complete reports whether every committed relocation (eviction accepted or
+// indirectly removed) has finished replacement placement. PDB-blocked
+// relocations still waiting for eviction are excluded so the accepted subset
+// can finalize while a stuck sibling keeps retrying.
 func Complete(run *repackv1alpha1.RepackRun) bool {
 	if run == nil || len(run.Status.Relocations) == 0 {
 		return false
 	}
+	foundCommitted := false
 	for index := range run.Status.Relocations {
-		switch run.Status.Relocations[index].Placement.Phase {
+		relocation := &run.Status.Relocations[index]
+		if !EvictionAllowsPlacement(relocation) {
+			continue
+		}
+		foundCommitted = true
+		switch relocation.Placement.Phase {
 		case repackv1alpha1.PodPlacementPlaced, repackv1alpha1.PodPlacementTimedOut:
 		default:
 			return false
 		}
 	}
-	return true
+	return foundCommitted
 }
 
 type FreedNodeComparison struct {

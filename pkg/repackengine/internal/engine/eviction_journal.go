@@ -18,12 +18,123 @@ package engine
 
 import (
 	"sort"
+	"time"
 
 	"k8s.io/apimachinery/pkg/types"
 
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
 	placementexecutor "volcano.sh/volcano/pkg/repackengine/executor/placement"
 )
+
+// hasUnfinishedEvictions reports whether any relocation still needs an eviction
+// attempt (Pending, InProgress, or never started).
+func hasUnfinishedEvictions(run *repackv1alpha1.RepackRun) bool {
+	for index := range run.Status.Relocations {
+		switch run.Status.Relocations[index].Eviction.Phase {
+		case "", repackv1alpha1.PodEvictionPending, repackv1alpha1.PodEvictionInProgress:
+			return true
+		}
+	}
+	return false
+}
+
+// hasCommittedRelocations reports whether any relocation's eviction was
+// accepted (Accepted or IndirectlyRemoved).
+func hasCommittedRelocations(run *repackv1alpha1.RepackRun) bool {
+	for index := range run.Status.Relocations {
+		if placementexecutor.EvictionAllowsPlacement(&run.Status.Relocations[index]) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasAcceptedPlacementWork reports whether a committed relocation still has
+// unfinished replacement placement (WaitingForReplacement / WaitingForNodeSelection
+// / Nominated).
+func hasAcceptedPlacementWork(run *repackv1alpha1.RepackRun) bool {
+	for index := range run.Status.Relocations {
+		relocation := &run.Status.Relocations[index]
+		if !placementexecutor.EvictionAllowsPlacement(relocation) {
+			continue
+		}
+		switch relocation.Placement.Phase {
+		case repackv1alpha1.PodPlacementPlaced, repackv1alpha1.PodPlacementTimedOut:
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+// committedPlacementTimedOut reports whether any committed replacement timed out.
+func committedPlacementTimedOut(run *repackv1alpha1.RepackRun) bool {
+	for index := range run.Status.Relocations {
+		relocation := &run.Status.Relocations[index]
+		if !placementexecutor.EvictionAllowsPlacement(relocation) {
+			continue
+		}
+		if relocation.Placement.Phase == repackv1alpha1.PodPlacementTimedOut {
+			return true
+		}
+	}
+	return false
+}
+
+// committedPlacementsComplete reports whether every committed relocation
+// (Accepted/IndirectlyRemoved) has finished placement. PDB-blocked victims
+// (Eviction=InProgress, Placement=WaitingForReplacement) are deliberately
+// excluded so they cannot block the accepted subset.
+func committedPlacementsComplete(run *repackv1alpha1.RepackRun) bool {
+	found := false
+	for index := range run.Status.Relocations {
+		relocation := &run.Status.Relocations[index]
+		if !placementexecutor.EvictionAllowsPlacement(relocation) {
+			continue
+		}
+		found = true
+		switch relocation.Placement.Phase {
+		case repackv1alpha1.PodPlacementPlaced, repackv1alpha1.PodPlacementTimedOut:
+		default:
+			return false
+		}
+	}
+	return found
+}
+
+// executeAction is the single Execute-state decision: replacement
+// placement always precedes further eviction.
+type executeAction int
+
+const (
+	executePlacement executeAction = iota
+	executeEviction
+	executeWait
+	executeFinalize
+)
+
+// nextExecuteAction decides what the single Execute worker does next. Placement
+// work (accepted-but-unfinished replacements) wins over eviction; a timed-out
+// committed placement stops any further eviction; a retryable victim that
+// is not yet due yields executeWait with the precise retry delay.
+func (e *Engine) nextExecuteAction(run *repackv1alpha1.RepackRun) (executeAction, time.Duration) {
+	switch {
+	case committedPlacementTimedOut(run):
+		return executeFinalize, 0
+	case hasAcceptedPlacementWork(run):
+		return executePlacement, 0
+	case hasUnfinishedEvictions(run):
+		if e.retryDeadlinePassed(run) {
+			return executeFinalize, 0
+		}
+		if retryAfter, any := e.nextDueEviction(run); any && retryAfter > 0 {
+			return executeWait, retryAfter
+		}
+		return executeEviction, 0
+	default:
+		return executeFinalize, 0
+	}
+}
 
 func plannedVictims(run *repackv1alpha1.RepackRun) []plannedVictim {
 	if run == nil || run.Status.Plan == nil {

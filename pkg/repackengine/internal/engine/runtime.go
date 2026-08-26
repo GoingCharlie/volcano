@@ -80,6 +80,12 @@ type Engine struct {
 	// worker starts.
 	pendingTerminalStatuses map[string]*repackv1alpha1.RepackRunStatus
 
+	// evictionRetryStates holds the in-memory PDB backoff per (run, relocation index).
+	evictionRetryStates map[string]map[int]*evictionRetryState
+	// evictionBlocked tracks per-run temporary block state so events are emitted
+	// only on the first block and the first recovery.
+	evictionBlocked map[string]bool
+
 	placementRepairLimiter placementRepairLimiter
 }
 
@@ -105,8 +111,8 @@ func NewEngine(config *rest.Config, engineConfig Config) (*Engine, error) {
 		repackRunInformerSynced: informer.Informer().HasSynced,
 		workQueue:               workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
 		now:                     time.Now,
-		pendingTerminalStatuses: make(map[string]*repackv1alpha1.RepackRunStatus),
-	}
+		pendingTerminalStatuses: make(map[string]*repackv1alpha1.RepackRunStatus), evictionRetryStates: make(map[string]map[int]*evictionRetryState),
+		evictionBlocked: make(map[string]bool)}
 	informer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: e.enqueue,
 		UpdateFunc: func(oldObj, newObj interface{}) {

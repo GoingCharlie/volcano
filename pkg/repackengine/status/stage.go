@@ -69,6 +69,18 @@ func evictionPending(run *repackv1alpha1.RepackRun) bool {
 		run.Status.Phase != repackv1alpha1.RepackRunning || run.Status.Plan == nil {
 		return false
 	}
+	// A ReconcilingPlacements condition takes priority over any retryable
+	// InProgress sibling: accepted replacements must be placed first so their
+	// PodGroups recover and restore PDB allowance, unblocking the retryable
+	// victims. Once placement finishes, the condition is cleared and the run
+	// returns to eviction to retry the remaining siblings.
+	for index := range run.Status.Conditions {
+		condition := &run.Status.Conditions[index]
+		if condition.Type == state.CondProgressing && condition.Status == metav1.ConditionTrue &&
+			condition.Reason == state.ReasonReconcilingPlacements {
+			return false
+		}
+	}
 	evictionJournalPresent := false
 	for index := range run.Status.Relocations {
 		phase := run.Status.Relocations[index].Eviction.Phase
@@ -81,13 +93,6 @@ func evictionPending(run *repackv1alpha1.RepackRun) bool {
 	}
 	if !evictionJournalPresent {
 		return false
-	}
-	for index := range run.Status.Conditions {
-		condition := &run.Status.Conditions[index]
-		if condition.Type == state.CondProgressing && condition.Status == metav1.ConditionTrue &&
-			condition.Reason == state.ReasonReconcilingPlacements {
-			return false
-		}
 	}
 	// Every outcome may be final while the accepted subset and placement barrier
 	// are not yet durable. Resume eviction finalization in that window.
