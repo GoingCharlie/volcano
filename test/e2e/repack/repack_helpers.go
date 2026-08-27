@@ -767,6 +767,26 @@ func runningPodCount(ctx *e2eutil.TestContext) int {
 	return n
 }
 
+// waitPDBAllowance blocks until the disruption controller computed the PDB
+// status (DisruptionsAllowed == allowed) AND gives the engine's informer cache
+// a grace period to observe it. The pdbaware plugin reads PDBs from that cache
+// at planning time, so a test that gates planning behavior on a PDB must not
+// race the watch propagation from the API server to the engine.
+func waitPDBAllowance(ctx *e2eutil.TestContext, name string, allowed int32) {
+	Eventually(func() int32 {
+		pdb, err := ctx.Kubeclient.PolicyV1().PodDisruptionBudgets(ctx.Namespace).Get(
+			context.TODO(), name, metav1.GetOptions{})
+		if err != nil {
+			return -1
+		}
+		return pdb.Status.DisruptionsAllowed
+	}, repackTimeout, repackPoll).Should(Equal(allowed),
+		"the disruption controller must compute DisruptionsAllowed=%d", allowed)
+	// The engine's informer cache lags the API server by a watch round-trip;
+	// wait it out so the planning-time check is deterministic.
+	time.Sleep(5 * time.Second)
+}
+
 // withEvictionRetryTimeout patches the repack-engine deployment to a short
 // --repack-eviction-retry-timeout (the PDB-eviction retry deadline) so the
 // PDB-retry e2e cases can observe the deadline-based terminal within the test

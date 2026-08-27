@@ -32,6 +32,7 @@ import (
 	"volcano.sh/volcano/pkg/repackengine/framework"
 	_ "volcano.sh/volcano/pkg/repackengine/plugins/binpack"
 	_ "volcano.sh/volcano/pkg/repackengine/plugins/gangdisruption"
+	_ "volcano.sh/volcano/pkg/repackengine/plugins/pdbaware"
 	_ "volcano.sh/volcano/pkg/repackengine/plugins/repackbudget"
 	_ "volcano.sh/volcano/pkg/repackengine/plugins/workloaddisruption"
 )
