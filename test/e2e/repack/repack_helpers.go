@@ -787,6 +787,84 @@ func waitPDBAllowance(ctx *e2eutil.TestContext, name string, allowed int32) {
 	time.Sleep(5 * time.Second)
 }
 
+// evictionJournalVictim describes one durable eviction intent written directly
+// into a RepackRun status, bypassing real planning — which the pdbaware plugin
+// would filter PDB-blocked victims out of. The engine resumes the eviction wave
+// against the real PDB once unpaused, so the execute-time PDB retry semantics
+// (backoff, retry deadline, restart recovery, UID precondition) stay testable
+// even though pdbaware keeps such victims out of a freshly planned plan.
+type evictionJournalVictim struct {
+	podGroupName string
+	podName      string
+	podUID       types.UID
+	fromNode     string
+	toNode       string
+	cards        int64
+}
+
+// prepareEvictionJournal creates an Execute run and writes a durable plan +
+// Pending relocation journal directly (simulating a completed planning cycle).
+// The caller must pause the engine first (pauseRepackEngine) so the run is not
+// planned before the journal is injected, then restore it to resume eviction.
+func prepareEvictionJournal(ctx *e2eutil.TestContext, name string, freedNodes []string, victims []evictionJournalVictim) *repackv1alpha1.RepackRun {
+	run, err := newRun(name, repackv1alpha1.RepackModeExecute).goal(npuResource).create(ctx)
+	Expect(err).NotTo(HaveOccurred())
+	moves := make([]repackv1alpha1.RepackMove, 0, len(victims))
+	relocations := make([]repackv1alpha1.PodRelocationStatus, 0, len(victims))
+	var movedCards int64
+	for _, victim := range victims {
+		// Mirror the engine's resolveMoveOwners: the replacement protocol derives
+		// source PodGroups per workload from plan.moves[].owner, which must equal
+		// the PodGroup's direct controller ownerReference — for a Deployment pod
+		// that is the ReplicaSet, not the Deployment. Without a matching owner a
+		// replacement Pod is treated as unmatched and its gate is released.
+		var owner *repackv1alpha1.WorkloadRef
+		if podGroup, getErr := ctx.Vcclient.SchedulingV1beta1().PodGroups(ctx.Namespace).Get(
+			context.TODO(), victim.podGroupName, metav1.GetOptions{}); getErr == nil {
+			if controllerRef := metav1.GetControllerOf(podGroup); controllerRef != nil {
+				owner = &repackv1alpha1.WorkloadRef{
+					APIVersion: controllerRef.APIVersion,
+					Kind:       controllerRef.Kind,
+					Name:       controllerRef.Name,
+				}
+			}
+		}
+		moves = append(moves, repackv1alpha1.RepackMove{
+			Namespace: ctx.Namespace, PodGroupName: victim.podGroupName, Owner: owner, Cards: victim.cards,
+			Pods: []repackv1alpha1.PodMove{{Name: victim.podName, FromNode: victim.fromNode, ToNode: victim.toNode, Cards: victim.cards}},
+		})
+		movedCards += victim.cards
+		relocations = append(relocations, repackv1alpha1.PodRelocationStatus{
+			Namespace: ctx.Namespace, PodGroupName: victim.podGroupName,
+			VictimPodName: victim.podName, VictimPodUID: victim.podUID,
+			PlannedNodeName: victim.toNode,
+			Eviction: repackv1alpha1.PodEvictionStatus{
+				Phase:   repackv1alpha1.PodEvictionPending,
+				Message: "Eviction intent is durable; the Eviction API request may now be issued.",
+			},
+			Placement: repackv1alpha1.PodPlacementStatus{Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
+		})
+	}
+	now := metav1.NewTime(time.Now())
+	run.Status = repackv1alpha1.RepackRunStatus{
+		Phase:     repackv1alpha1.RepackRunning,
+		StartTime: &now,
+		Plan: &repackv1alpha1.RepackPlan{
+			Summary: &repackv1alpha1.RepackSummary{
+				FreedNodeCount: int32(len(freedNodes)),
+				MovedCardCount: movedCards,
+			},
+			FreedNodes: freedNodes,
+			Moves:      moves,
+		},
+		Result:      &repackv1alpha1.RepackResult{MovedCardCount: movedCards},
+		Relocations: relocations,
+	}
+	run, err = ctx.Vcclient.RepackV1alpha1().RepackRuns().UpdateStatus(context.TODO(), run, metav1.UpdateOptions{})
+	Expect(err).NotTo(HaveOccurred(), "persist eviction journal")
+	return run
+}
+
 // withEvictionRetryTimeout patches the repack-engine deployment to a short
 // --repack-eviction-retry-timeout (the PDB-eviction retry deadline) so the
 // PDB-retry e2e cases can observe the deadline-based terminal within the test

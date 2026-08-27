@@ -52,21 +52,37 @@ var _ = Describe("Repack pdbaware planning-time PDB filtering", Serial, func() {
 		}
 	})
 
-	// PDB-1: one PDB-blocked workload and two open workloads share a fragmented
-	// cluster. The DryRun plan must include the open workloads and completely
-	// exclude the PDB-blocked one — proving the pdbaware planning-time filter
-	// (a PDB-blocked Pod never enters a plan, so it can never be evicted).
-	It("excludes a PDB-blocked workload from the plan while planning the open ones", func() {
+	// PDB-1: three workloads share a fragmented cluster: one fully PDB-blocked
+	// (maxUnavailable=0 → DisruptionsAllowed=0), one with a PDB that still has
+	// allowance (maxUnavailable=1 → DisruptionsAllowed=1), and one without a PDB.
+	// The DryRun plan must include the two workloads that may be disrupted and
+	// completely exclude the fully blocked one — proving the pdbaware filter
+	// vetoes ONLY DisruptionsAllowed==0 and never touches workloads whose PDB
+	// still permits disruption.
+	It("excludes only the fully PDB-blocked workload from the plan while planning the others", func() {
 		openA := occupyNativeDeployment(ctx, "pa-open-a", nodes[0], "move", 4)
 		openB := occupyNativeDeployment(ctx, "pa-open-b", nodes[1], "move", 2)
 		protected := occupyNativeDeployment(ctx, "pa-protected", nodes[2], "move", 2)
 		defer deleteNativeWorkloads(ctx, openA, openB, protected)
 
-		// A maxUnavailable=0 PDB fully blocks the protected workload: the
-		// disruption controller computes DisruptionsAllowed=0, which pdbaware
-		// must honor at planning time.
-		blockAll := intstr.FromInt(0)
+		// openB keeps a PDB that still allows one disruption: pdbaware must NOT
+		// filter it, even though it is PDB-protected.
+		allowOne := intstr.FromInt(1)
 		_, err := ctx.Kubeclient.PolicyV1().PodDisruptionBudgets(ctx.Namespace).Create(context.TODO(),
+			&policyv1.PodDisruptionBudget{
+				ObjectMeta: metav1.ObjectMeta{Name: "pa-open-b-pdb"},
+				Spec: policyv1.PodDisruptionBudgetSpec{
+					MaxUnavailable: &allowOne,
+					Selector:       &metav1.LabelSelector{MatchLabels: map[string]string{nativeWorkloadLabel: openB.deployment.Name}},
+				},
+			}, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred())
+		waitPDBAllowance(ctx, "pa-open-b-pdb", 1)
+
+		// protected is fully blocked (DisruptionsAllowed=0), which pdbaware must
+		// honor at planning time.
+		blockAll := intstr.FromInt(0)
+		_, err = ctx.Kubeclient.PolicyV1().PodDisruptionBudgets(ctx.Namespace).Create(context.TODO(),
 			&policyv1.PodDisruptionBudget{
 				ObjectMeta: metav1.ObjectMeta{Name: "pa-block"},
 				Spec: policyv1.PodDisruptionBudgetSpec{
@@ -78,7 +94,7 @@ var _ = Describe("Repack pdbaware planning-time PDB filtering", Serial, func() {
 		waitPDBAllowance(ctx, "pa-block", 0)
 
 		// The scope admits all three "move" workloads as candidates; only the
-		// pdbaware veto may keep the protected one out of the plan.
+		// pdbaware veto may keep the fully blocked one out of the plan.
 		run, err := newRun("pa-plan", repackv1alpha1.RepackModeDryRun).
 			goal(npuResource).
 			scope(&repackv1alpha1.RepackScope{
@@ -99,10 +115,14 @@ var _ = Describe("Repack pdbaware planning-time PDB filtering", Serial, func() {
 		planned := map[string]bool{}
 		for _, mv := range got.Status.Plan.Moves {
 			Expect(mv.PodGroupName).NotTo(Equal(protected.podGroup),
-				"a PDB-blocked workload must never be planned as a victim")
+				"a fully PDB-blocked workload must never be planned as a victim")
 			planned[mv.PodGroupName] = true
 		}
+		// The unprotected workload AND the PDB-protected-but-still-allowed one
+		// must both be planned: pdbaware filters only DisruptionsAllowed==0.
 		Expect(planned[openA.podGroup] || planned[openB.podGroup]).To(BeTrue(),
 			"at least one open workload must be planned for consolidation")
+		Expect(planned[openB.podGroup]).To(BeTrue(),
+			"a PDB with remaining allowance must not be filtered by pdbaware")
 	})
 })

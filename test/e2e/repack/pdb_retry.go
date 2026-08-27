@@ -26,9 +26,9 @@ import (
 	v1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
-	batchv1alpha1 "volcano.sh/apis/pkg/apis/batch/v1alpha1"
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
 
 	e2eutil "volcano.sh/volcano/test/e2e/util"
@@ -140,15 +140,20 @@ var _ = Describe("Repack PDB retry & backoff", Serial, func() {
 		}, repackTimeout, repackPoll).Should(BeTrue(), "gang must recover on new nodes")
 	})
 
-	// E2E-3: one PDB-blocked workload and two open workloads in the scope. The
-	// pdbaware plugin vetoes the PDB-blocked victim at PLAN time, so the plan
-	// contains only the open workloads: they are evicted and placed, freeing a
-	// node, while the PDB-protected workload is never planned or touched.
-	It("plans only the open workloads and never touches the PDB-blocked one", func() {
-		openA := occupyNativeDeployment(ctx, "e3-open-a", nodes[0], "move", 4)
-		openB := occupyNativeDeployment(ctx, "e3-open-b", nodes[1], "move", 2)
-		protected := occupyNativeDeployment(ctx, "e3-protected", nodes[2], "move", 2)
-		defer deleteNativeWorkloads(ctx, openA, openB, protected)
+	// E2E-3: an accepted eviction's replacement is placed BEFORE the retryable
+	// (PDB-blocked) victim is retried to the eviction deadline. A durable
+	// eviction journal is injected directly (bypassing planning, which the
+	// pdbaware plugin would filter the blocked victim out of), so the
+	// execute-time PDB retry semantics stay observable: the open victim is
+	// accepted and placed first, the protected one stays InProgress and is
+	// retried until the deadline, then rejected — the Run fails
+	// BenefitNotRealized and the protected Pod survives.
+	It("places the accepted replacement before retrying the PDB-blocked victim to the deadline", func() {
+		DeferCleanup(withEvictionRetryTimeout(ctx, 25*time.Second))
+
+		open := occupyNativeDeployment(ctx, "e3-open", nodes[0], "move", 2)
+		protected := occupyNativeDeployment(ctx, "e3-protected", nodes[0], "move", 2)
+		defer deleteNativeWorkloads(ctx, open, protected)
 
 		blockAll := intstr.FromInt(0)
 		_, err := ctx.Kubeclient.PolicyV1().PodDisruptionBudgets(ctx.Namespace).Create(context.TODO(),
@@ -162,102 +167,142 @@ var _ = Describe("Repack PDB retry & backoff", Serial, func() {
 		Expect(err).NotTo(HaveOccurred())
 		waitPDBAllowance(ctx, "e3-protect-pdb", 0)
 
-		run, err := newRun("e3-pdbaware", repackv1alpha1.RepackModeExecute).
-			goal(npuResource).
-			scope(&repackv1alpha1.RepackScope{
-				PodGroups: &repackv1alpha1.RepackSelectorTerm{
-					Include: &repackv1alpha1.RepackSelector{Selector: &metav1.LabelSelector{
-						MatchLabels: map[string]string{nativeScopeLabel: "move"}}},
-				},
-			}).
-			create(ctx)
-		Expect(err).NotTo(HaveOccurred())
+		// Freeze the engine, inject a durable plan+Pending journal that includes
+		// BOTH victims — the blocked one enters the plan because the journal is
+		// written directly, not via pdbaware-filtered planning — then resume.
+		restoreEngine := pauseRepackEngine(ctx)
+		defer restoreEngine()
+		run := prepareEvictionJournal(ctx, "e3-retry", []string{nodes[0]}, []evictionJournalVictim{
+			{podGroupName: open.podGroup, podName: open.podName, podUID: open.podUID, fromNode: nodes[0], toNode: nodes[1], cards: 2},
+			{podGroupName: protected.podGroup, podName: protected.podName, podUID: protected.podUID, fromNode: nodes[0], toNode: nodes[1], cards: 2},
+		})
 		defer deleteRun(ctx, run.Name)
+		restoreEngine()
 
-		// pdbaware must keep the PDB-blocked workload out of the journal
-		// entirely, while at least one open workload is evicted and placed.
+		// The accepted replacement is placed while the protected victim stays
+		// blocked (placement priority over the next wave).
 		Eventually(func() bool {
-			openPlaced := false
+			openPlaced, protectedBlocked := false, false
 			for _, relocation := range getRun(ctx, run.Name).Status.Relocations {
 				switch relocation.PodGroupName {
-				case openA.podGroup, openB.podGroup:
-					openPlaced = openPlaced ||
-						(relocation.Eviction.Phase == repackv1alpha1.PodEvictionAccepted &&
-							relocation.Placement.Phase == repackv1alpha1.PodPlacementPlaced)
+				case open.podGroup:
+					openPlaced = relocation.Eviction.Phase == repackv1alpha1.PodEvictionAccepted &&
+						relocation.Placement.Phase == repackv1alpha1.PodPlacementPlaced
+				case protected.podGroup:
+					protectedBlocked = relocation.Eviction.Phase == repackv1alpha1.PodEvictionInProgress
 				}
 			}
-			return openPlaced
+			return openPlaced && protectedBlocked
 		}, repackTimeout, repackPoll).Should(BeTrue(),
-			"an open workload must be evicted and its replacement placed")
+			"the unprotected replacement must be placed while the protected victim stays blocked")
 
+		// The protected victim is retried until the deadline, then rejected: the
+		// planned node cannot be freed, so the Run fails without touching it.
 		got := waitTerminal(ctx, run.Name)
-		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
-		Expect(completeReason(got)).To(Equal("ExecutionCompleted"))
-		// The PDB-blocked workload was never planned, so it was never touched.
-		for _, relocation := range got.Status.Relocations {
-			Expect(relocation.PodGroupName).NotTo(Equal(protected.podGroup),
-				"a PDB-blocked workload must never be planned or evicted")
-		}
+		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackFailed))
+		Expect(completeReason(got)).To(Equal("BenefitNotRealized"))
 		protectedPod, err := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Get(
 			context.TODO(), protected.podName, metav1.GetOptions{})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(protectedPod.Status.Phase).To(Equal(v1.PodRunning))
-		Expect(protectedPod.Spec.NodeName).To(Equal(nodes[2]),
+		Expect(protectedPod.Spec.NodeName).To(Equal(nodes[0]),
 			"the PDB-protected workload must never be evicted")
 	})
 
-	// E2E-4: every candidate workload is fully PDB-blocked (maxUnavailable=0).
-	// The pdbaware plugin excludes them all at planning time, so the Run plans
-	// nothing, never evicts, and fails quickly without touching any Pod.
-	It("plans and evicts nothing when every candidate is PDB-blocked", func() {
-		jobA := occupy(ctx, "e4-a", nodes[0], 4)
-		jobB := occupy(ctx, "e4-b", nodes[1], 2)
+	// E2E-4: while all evictions are PDB-blocked, restart the engine. The new
+	// instance must resume the SAME victim (UID precondition — no double-evict)
+	// and keep retrying until the deadline, without bypassing the PDB. The
+	// victims enter the plan via a directly injected durable journal (pdbaware
+	// would filter them out of a freshly planned plan), so the execute-time
+	// restart-recovery semantics stay observable.
+	It("resumes a PDB-blocked eviction after an Engine restart without double-evicting", func() {
+		DeferCleanup(withEvictionRetryTimeout(ctx, 60*time.Second))
+
+		jobA := occupyNativeDeployment(ctx, "e4-a", nodes[0], "move", 4)
+		jobB := occupyNativeDeployment(ctx, "e4-b", nodes[1], "move", 2)
+		defer deleteNativeWorkloads(ctx, jobA, jobB)
+
 		blockAll := intstr.FromInt(0)
-		for _, job := range []*batchv1alpha1.Job{jobA, jobB} {
-			pdbName := "e4-block-" + job.Name
+		for _, workload := range []*nativeWorkload{jobA, jobB} {
+			pdbName := "e4-block-" + workload.deployment.Name
 			_, err := ctx.Kubeclient.PolicyV1().PodDisruptionBudgets(ctx.Namespace).Create(context.TODO(),
 				&policyv1.PodDisruptionBudget{
 					ObjectMeta: metav1.ObjectMeta{Name: pdbName},
 					Spec: policyv1.PodDisruptionBudgetSpec{
 						MaxUnavailable: &blockAll,
-						Selector:       &metav1.LabelSelector{MatchLabels: map[string]string{"volcano.sh/job-name": job.Name}},
+						Selector:       &metav1.LabelSelector{MatchLabels: map[string]string{nativeWorkloadLabel: workload.deployment.Name}},
 					},
 				}, metav1.CreateOptions{})
 			Expect(err).NotTo(HaveOccurred())
 			waitPDBAllowance(ctx, pdbName, 0)
 		}
 
-		run, err := newRun("e4-blocked", repackv1alpha1.RepackModeExecute).goal(npuResource).create(ctx)
-		Expect(err).NotTo(HaveOccurred())
+		// Inject a durable journal with both PDB-blocked victims, then resume.
+		restoreEngine := pauseRepackEngine(ctx)
+		defer restoreEngine()
+		run := prepareEvictionJournal(ctx, "e4-restart", []string{nodes[0]}, []evictionJournalVictim{
+			{podGroupName: jobA.podGroup, podName: jobA.podName, podUID: jobA.podUID, fromNode: nodes[0], toNode: nodes[2], cards: 4},
+			{podGroupName: jobB.podGroup, podName: jobB.podName, podUID: jobB.podUID, fromNode: nodes[1], toNode: nodes[2], cards: 2},
+		})
 		defer deleteRun(ctx, run.Name)
+		restoreEngine()
 
-		got := waitTerminal(ctx, run.Name)
-		// pdbaware excludes every PDB-blocked victim, so no plan is produced;
-		// with no plan to execute the Run completes normally (no eviction is
-		// even attempted), reporting why no consolidation happened.
-		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
-		Expect(completeReason(got)).To(SatisfyAny(
-			Equal("NoFragmentation"),
-			Equal("InsufficientImprovement")))
-		Expect(got.Status.Relocations).To(BeEmpty(),
-			"PDB-blocked victims must never be planned or evicted")
-		// Zero disturbance: both workloads are still Running.
-		for _, job := range []*batchv1alpha1.Job{jobA, jobB} {
-			Eventually(func() bool {
-				pods, listErr := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).List(context.TODO(), metav1.ListOptions{
-					LabelSelector: "volcano.sh/job-name=" + job.Name,
-				})
-				if listErr != nil || len(pods.Items) == 0 {
+		// Reach the blocked state: durable InProgress victims that the PDB
+		// refuses to let the API evict (the pods themselves are never deleted).
+		Eventually(func() bool {
+			r := getRun(ctx, run.Name)
+			if len(r.Status.Relocations) == 0 {
+				return false
+			}
+			for _, relocation := range r.Status.Relocations {
+				if relocation.Eviction.Phase != repackv1alpha1.PodEvictionInProgress {
 					return false
 				}
-				for i := range pods.Items {
-					if pods.Items[i].Status.Phase != v1.PodRunning {
-						return false
-					}
-				}
-				return true
-			}, fixtureTimeout, repackPoll).Should(BeTrue(),
-				"the PDB-blocked workload must remain running")
+			}
+			return true
+		}, repackTimeout, repackPoll).Should(BeTrue(), "every planned victim must be PDB-blocked InProgress")
+		victimUIDs := map[types.UID]bool{}
+		for _, relocation := range getRun(ctx, run.Name).Status.Relocations {
+			Expect(relocation.VictimPodUID).NotTo(BeEmpty())
+			victimUIDs[relocation.VictimPodUID] = true
+		}
+		for victimUID := range victimUIDs {
+			Expect(podStillRunningWithUID(ctx, ctx.Namespace, victimUID)).To(BeTrue(),
+				"a blocked eviction must never delete its victim")
+		}
+
+		// Restart the engine (scale to 0, then back to 1).
+		restart := pauseRepackEngine(ctx)
+		restart()
+
+		// After restart the engine resumes the SAME durable victims: the journal
+		// keeps the original UIDs and the API-level UID precondition prevents any
+		// double-evict of a same-name replacement.
+		Eventually(func() repackv1alpha1.PodEvictionPhase {
+			r := getRun(ctx, run.Name)
+			if len(r.Status.Relocations) == 0 {
+				return ""
+			}
+			return r.Status.Relocations[0].Eviction.Phase
+		}, repackTimeout, repackPoll).Should(Or(
+			Equal(repackv1alpha1.PodEvictionInProgress),
+			Equal(repackv1alpha1.PodEvictionRejected)),
+			"restarted engine must resume the blocked eviction")
+		for _, relocation := range getRun(ctx, run.Name).Status.Relocations {
+			Expect(victimUIDs[relocation.VictimPodUID]).To(BeTrue(),
+				"the resumed journal must keep targeting the original victim instances")
+		}
+		for victimUID := range victimUIDs {
+			Expect(podStillRunningWithUID(ctx, ctx.Namespace, victimUID)).To(BeTrue(),
+				"restart must not double-evict a victim")
+		}
+
+		got := waitTerminal(ctx, run.Name)
+		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackFailed))
+		Expect(completeReason(got)).To(Equal("EvictionFailed"))
+		for victimUID := range victimUIDs {
+			Expect(podStillRunningWithUID(ctx, ctx.Namespace, victimUID)).To(BeTrue(),
+				"PDB was never bypassed across the restart")
 		}
 	})
 
