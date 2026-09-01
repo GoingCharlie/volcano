@@ -804,7 +804,13 @@ func (n *Nominator) hasPotentialNominationForPod(
 // hasPotentialSourceNomination reports whether any relocation for the given
 // source PodGroups still has unfinished eviction work that a pending replacement
 // Pod could claim — including the transient InProgress state, which the strict
-// claimable check treats as not-yet-available.
+// claimable check treats as not-yet-available. Pending is included too as a
+// robustness guard: the engine persists its durable InProgress barrier before
+// issuing the Eviction API call, so under normal timing a replacement Pod is
+// never observed while the intent is still Pending. If that ordering is ever
+// disturbed (a future refactor, or a crash landing between the barrier write and
+// the eviction), a replacement racing ahead must still not lose its gate and
+// schedule freely.
 func hasPotentialSourceNomination(
 	run *repackv1alpha1.RepackRun,
 	namespace string,
@@ -838,8 +844,8 @@ func hasPotentialSourceNomination(
 			continue
 		}
 		switch nomination.Eviction.Phase {
-		case repackv1alpha1.PodEvictionInProgress, repackv1alpha1.PodEvictionAccepted,
-			repackv1alpha1.PodEvictionIndirectlyRemoved:
+		case repackv1alpha1.PodEvictionPending, repackv1alpha1.PodEvictionInProgress,
+			repackv1alpha1.PodEvictionAccepted, repackv1alpha1.PodEvictionIndirectlyRemoved:
 			if nomination.SchedulingRequirementsHash == "" ||
 				nomination.SchedulingRequirementsHash == candidateSchedulingRequirementsHash {
 				return true

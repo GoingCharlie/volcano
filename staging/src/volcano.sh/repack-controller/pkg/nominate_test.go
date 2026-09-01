@@ -1231,3 +1231,77 @@ func TestNominationUnavailableUntilEvictionSucceeds(t *testing.T) {
 		}
 	}
 }
+
+// TestPotentialSourceNominationRetainsGateAcrossEvictionTransient locks in the
+// nominator/engine desync window: a workload controller recreates the
+// replacement the moment the Eviction API accepts the victim, which may be
+// before the engine has persisted Eviction=Accepted. The strict claimable check
+// (EvictionAllowsPlacement) treats that InProgress intent as unavailable, so
+// the potential-source fallback must keep the gated replacement held instead of
+// releasing it — otherwise the Pod schedules freely, the engine can never match
+// it in reconcilePlacement, and placement times out.
+func TestPotentialSourceNominationRetainsGateAcrossEvictionTransient(t *testing.T) {
+	now := time.Unix(1000, 0)
+	sourcePodGroups := []string{"old"}
+
+	// The exact E2E-3 window: eviction already issued (InProgress) but the
+	// Accepted outcome not yet durable. The gate must stay closed.
+	run := runWithNoms("run", repackv1alpha1.PodRelocationStatus{
+		Namespace: "ns", PodGroupName: "old", VictimPodName: "old-0",
+		Placement: repackv1alpha1.PodPlacementStatus{Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
+	})
+	run.Status.Relocations[0].Eviction.Phase = repackv1alpha1.PodEvictionInProgress
+	if !hasPotentialSourceNomination(run, "ns", sourcePodGroups, "", now) {
+		t.Fatal("an InProgress eviction (accepted by the API but not yet persisted) must keep a potential replacement gated")
+	}
+
+	// Pending is a robustness guard: the engine persists its durable InProgress
+	// barrier before issuing the Eviction API call, but if that ordering is ever
+	// disturbed the replacement racing ahead must still not lose its gate.
+	run.Status.Relocations[0].Eviction.Phase = repackv1alpha1.PodEvictionPending
+	if !hasPotentialSourceNomination(run, "ns", sourcePodGroups, "", now) {
+		t.Fatal("a Pending eviction (durable barrier not yet persisted) must keep a potential replacement gated")
+	}
+
+	// A hash-bearing intent gates only the compatible candidate: a different
+	// scheduling-requirements hash must not hold an unrelated Pod.
+	run.Status.Relocations[0].Eviction.Phase = repackv1alpha1.PodEvictionInProgress
+	run.Status.Relocations[0].SchedulingRequirementsHash = "hash-a"
+	if hasPotentialSourceNomination(run, "ns", sourcePodGroups, "hash-b", now) {
+		t.Fatal("a different scheduling requirements hash must not hold an unrelated Pod")
+	}
+	if !hasPotentialSourceNomination(run, "ns", sourcePodGroups, "hash-a", now) {
+		t.Fatal("the same scheduling requirements hash must keep the compatible candidate gated")
+	}
+
+	// Once eviction is durably accepted, the potential fallback keeps holding
+	// while replacement placement is still unfinished.
+	run.Status.Relocations[0].Eviction.Phase = repackv1alpha1.PodEvictionAccepted
+	if !hasPotentialSourceNomination(run, "ns", sourcePodGroups, "hash-a", now) {
+		t.Fatal("an accepted eviction must keep a potential replacement gated while placement is unfinished")
+	}
+
+	// A finished placement no longer needs to hold any Pod.
+	run.Status.Relocations[0].Placement.Phase = repackv1alpha1.PodPlacementPlaced
+	if hasPotentialSourceNomination(run, "ns", sourcePodGroups, "hash-a", now) {
+		t.Fatal("a placed replacement must not keep additional Pods gated")
+	}
+
+	// An intent already claimed by another replacement Pod must not hold this
+	// candidate (the claim is resolved via the concrete UID association).
+	run.Status.Relocations[0].Placement.Phase = repackv1alpha1.PodPlacementWaitingForReplacement
+	run.Status.Relocations[0].Eviction.Phase = repackv1alpha1.PodEvictionInProgress
+	run.Status.Relocations[0].Placement.ReplacementPodName = "other"
+	run.Status.Relocations[0].Placement.ReplacementPodUID = "other-uid"
+	if hasPotentialSourceNomination(run, "ns", sourcePodGroups, "", now) {
+		t.Fatal("a placement already claimed by another Pod must not hold this candidate")
+	}
+
+	// An expired placement deadline releases the gate.
+	run.Status.Relocations[0].Placement.ReplacementPodName = ""
+	run.Status.Relocations[0].Placement.ReplacementPodUID = ""
+	run.Status.Relocations[0].Placement.ExpirationTime = &metav1.Time{Time: time.Unix(500, 0)}
+	if hasPotentialSourceNomination(run, "ns", sourcePodGroups, "", now) {
+		t.Fatal("an expired placement must not keep a Pod gated")
+	}
+}
