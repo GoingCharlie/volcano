@@ -257,6 +257,12 @@ type RepackRunStatus struct {
 	// +optional
 	StartTime *metav1.Time `json:"startTime,omitempty"`
 
+	// ExecutionDeadline is the absolute deadline for the complete Execute
+	// lifecycle, including eviction, retry, replacement placement and result
+	// verification.
+	// +optional
+	ExecutionDeadline *metav1.Time `json:"executionDeadline,omitempty"`
+
 	// CompletionTime is when the run first reached a terminal phase (TTL anchor).
 	// +optional
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
@@ -352,9 +358,6 @@ type PodPlacementStatus struct {
 	// with SelectedNodeName reveals an alternative scheduler placement.
 	// +optional
 	ActualNodeName string `json:"actualNodeName,omitempty"`
-	// ExpirationTime bounds placement reconciliation.
-	// +optional
-	ExpirationTime *metav1.Time `json:"expirationTime,omitempty"`
 }
 
 // RepackPlan is the immutable plan-time output in both modes. Three progressive
