@@ -432,8 +432,9 @@ func TestPlacementBindingsVisible(t *testing.T) {
 func TestPlacementObservationDeadlinePassed(t *testing.T) {
 	deadline := metav1.NewTime(time.Unix(100, 0))
 	run := &repackv1alpha1.RepackRun{Status: repackv1alpha1.RepackRunStatus{
+		ExecutionDeadline: &deadline,
 		Relocations: []repackv1alpha1.PodRelocationStatus{{
-			Placement: repackv1alpha1.PodPlacementStatus{ExpirationTime: &deadline},
+			Placement: repackv1alpha1.PodPlacementStatus{},
 		}},
 	}}
 	if placementexecutor.ObservationDeadlinePassed(run, time.Unix(99, 0)) {
@@ -447,13 +448,11 @@ func TestPlacementObservationDeadlinePassed(t *testing.T) {
 func TestPlannedNodeFreeingCanConvergeUntilPlacementDeadline(t *testing.T) {
 	deadline := metav1.NewTime(time.Unix(100, 0))
 	run := &repackv1alpha1.RepackRun{Status: repackv1alpha1.RepackRunStatus{
+		ExecutionDeadline: &deadline,
 		Plan:   &repackv1alpha1.RepackPlan{FreedNodes: []string{"source"}},
 		Result: &repackv1alpha1.RepackResult{MetricsVerified: true},
 		Relocations: []repackv1alpha1.PodRelocationStatus{{
-			Placement: repackv1alpha1.PodPlacementStatus{
-				ExpirationTime: &deadline,
-				Phase:          repackv1alpha1.PodPlacementPlaced,
-			},
+			Placement: repackv1alpha1.PodPlacementStatus{Phase: repackv1alpha1.PodPlacementPlaced},
 		}},
 	}}
 
@@ -487,9 +486,10 @@ func TestExpirePlacementsIncludesNominatedReplacement(t *testing.T) {
 		Spec:       repackv1alpha1.RepackRunSpec{Mode: repackv1alpha1.RepackModeExecute},
 		Status: repackv1alpha1.RepackRunStatus{
 			Phase: repackv1alpha1.RepackRunning,
+			ExecutionDeadline: &deadline,
 			Relocations: []repackv1alpha1.PodRelocationStatus{{
 				Namespace: "ns", PodGroupName: "pg", VictimPodName: "victim", PlannedNodeName: "n2", Placement: repackv1alpha1.PodPlacementStatus{SelectedNodeName: "n2", ReplacementPodName: "replacement", ReplacementPodUID: "replacement-uid",
-					ExpirationTime: &deadline, Phase: repackv1alpha1.PodPlacementNominated},
+					Phase: repackv1alpha1.PodPlacementNominated},
 			}},
 		},
 	}
@@ -519,8 +519,8 @@ func TestExpirePlacementsDoesNotOverwriteConcurrentPlacementResult(t *testing.T)
 	deadline := metav1.NewTime(time.Unix(100, 0))
 	staleRun := &repackv1alpha1.RepackRun{
 		ObjectMeta: metav1.ObjectMeta{Name: "run", UID: types.UID("run-uid")},
-		Status: repackv1alpha1.RepackRunStatus{Relocations: []repackv1alpha1.PodRelocationStatus{{
-			Namespace: "ns", PodGroupName: "pg", VictimPodName: "victim", PlannedNodeName: "n2", Placement: repackv1alpha1.PodPlacementStatus{ExpirationTime: &deadline, Phase: repackv1alpha1.PodPlacementNominated},
+		Status: repackv1alpha1.RepackRunStatus{ExecutionDeadline: &deadline, Relocations: []repackv1alpha1.PodRelocationStatus{{
+			Namespace: "ns", PodGroupName: "pg", VictimPodName: "victim", PlannedNodeName: "n2", Placement: repackv1alpha1.PodPlacementStatus{Phase: repackv1alpha1.PodPlacementNominated},
 		}},
 		},
 	}

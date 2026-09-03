@@ -22,10 +22,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	"k8s.io/client-go/rest"
-
 	schedoptions "volcano.sh/volcano/cmd/scheduler/app/options"
 
 	_ "volcano.sh/volcano/pkg/repackengine/actions/repack"
@@ -59,9 +57,6 @@ func TestNewEngineAppliesDefaults(t *testing.T) {
 	wantPlugins := []string{"workloadscope", "repackbudget", "nodeconsolidation", "workloaddisruption", "gangdisruption", "binpack"}
 	if got := configuredPluginNames(e.config.Plugins); !reflect.DeepEqual(got, wantPlugins) {
 		t.Errorf("default Plugins=%v, want %v", got, wantPlugins)
-	}
-	if e.config.NominationTTL != 10*time.Minute {
-		t.Errorf("default NominationTTL = %v, want 10m", e.config.NominationTTL)
 	}
 }
 

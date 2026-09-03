@@ -180,20 +180,10 @@ func SortedUniqueNodeNames(nodeNames []string) []string {
 }
 
 func ObservationDeadlinePassed(run *repackv1alpha1.RepackRun, now time.Time) bool {
-	if run == nil || len(run.Status.Relocations) == 0 {
+	if run == nil || run.Status.ExecutionDeadline == nil {
 		return false
 	}
-	var latest time.Time
-	for index := range run.Status.Relocations {
-		expirationTime := run.Status.Relocations[index].Placement.ExpirationTime
-		if expirationTime == nil {
-			return false
-		}
-		if expirationTime.Time.After(latest) {
-			latest = expirationTime.Time
-		}
-	}
-	return !latest.IsZero() && !now.Before(latest)
+	return !now.Before(run.Status.ExecutionDeadline.Time)
 }
 
 func FreedNodeVerificationPending(run *repackv1alpha1.RepackRun, now time.Time) (FreedNodeComparison, bool) {
@@ -245,8 +235,8 @@ func MarkBenefitUnverified(run *repackv1alpha1.RepackRun) {
 	run.Status.Result.MetricsVerified = false
 }
 
-func CanExpire(relocation *repackv1alpha1.PodRelocationStatus, now time.Time) bool {
-	if relocation == nil || relocation.Placement.ExpirationTime == nil || now.Before(relocation.Placement.ExpirationTime.Time) {
+func CanExpire(run *repackv1alpha1.RepackRun, relocation *repackv1alpha1.PodRelocationStatus, now time.Time) bool {
+	if run == nil || run.Status.ExecutionDeadline == nil || relocation == nil || now.Before(run.Status.ExecutionDeadline.Time) {
 		return false
 	}
 	switch relocation.Placement.Phase {

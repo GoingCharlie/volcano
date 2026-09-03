@@ -21,6 +21,7 @@ import (
 	"fmt"
 
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 
 	repackv1alpha1 "volcano.sh/apis/pkg/apis/repack/v1alpha1"
@@ -127,8 +128,12 @@ func (r *actionRuntime) ResolveMoveOwners(ctx context.Context, plan *engineapi.R
 
 func (r *actionRuntime) PrepareExecution(ctx context.Context, run *repackv1alpha1.RepackRun, plan *engineapi.RepackPlan, snapshot engineframework.Snapshot) error {
 	e := r.engine
+	if run.Status.ExecutionDeadline == nil {
+		deadline := metav1.NewTime(e.now().Add(e.config.ExecutionTimeout))
+		run.Status.ExecutionDeadline = &deadline
+	}
 	policyReader, _ := snapshot.(enginestatus.PodGroupPlacementPolicyReader)
-	if err := enginestatus.PrepareExecuteRelocations(run, plan, e.config.NominationTTL, e.now(), policyReader); err != nil {
+	if err := enginestatus.PrepareExecuteRelocations(run, plan, e.now(), policyReader); err != nil {
 		enginestatus.MarkExecuteNotPerformed(run)
 		return engineframework.NewActionError(state.ReasonExecutionPreparationFailed,
 			fmt.Errorf("prepare per-Pod relocation records: %w", err))
@@ -166,7 +171,7 @@ func (r *actionRuntime) PrepareExecution(ctx context.Context, run *repackv1alpha
 			len(run.Status.Relocations), len(preparedGroups)))
 	klog.V(3).InfoS("repack: Execute plan prepared before eviction",
 		"run", run.Name, "moves", len(plan.Moves), "freedNodeCount", len(plan.FreedNodes),
-		"relocationCount", len(run.Status.Relocations), "nominationTTL", e.config.NominationTTL)
+		"relocationCount", len(run.Status.Relocations), "executionTimeout", e.config.ExecutionTimeout)
 	return nil
 }
 

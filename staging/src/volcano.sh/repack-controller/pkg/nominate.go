@@ -3,13 +3,14 @@ Copyright 2026 The Volcano Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
+
 You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+	WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
@@ -667,7 +668,7 @@ func (n *Nominator) recoverStalePlacementClaim(
 		for index := range latest.Status.Relocations {
 			nomination := &latest.Status.Relocations[index]
 			if !placementClaimCanBeRecoveredForPod(
-				nomination, candidate, candidateSchedulingRequirementsHash, now) {
+				latest, nomination, candidate, candidateSchedulingRequirementsHash, now) {
 				continue
 			}
 			replacement, getErr := n.kubernetesClient.CoreV1().Pods(nomination.Namespace).Get(
@@ -705,7 +706,7 @@ func hasRecoverablePlacementClaimForPod(
 	}
 	for index := range run.Status.Relocations {
 		if placementClaimCanBeRecoveredForPod(
-			&run.Status.Relocations[index], candidate, candidateSchedulingRequirementsHash, now) {
+			run, &run.Status.Relocations[index], candidate, candidateSchedulingRequirementsHash, now) {
 			return true
 		}
 	}
@@ -713,17 +714,18 @@ func hasRecoverablePlacementClaimForPod(
 }
 
 func placementClaimCanBeRecoveredForPod(
+	run *repackv1alpha1.RepackRun,
 	nomination *repackv1alpha1.PodRelocationStatus,
 	candidate *corev1.Pod,
 	candidateSchedulingRequirementsHash string,
 	now time.Time,
 ) bool {
 	if nomination == nil || candidate == nil ||
+		executionDeadlinePassedForRun(run, now) ||
 		!placement.EvictionAllowsPlacement(nomination) ||
 		nomination.Placement.ReplacementPodName == "" || nomination.Placement.ReplacementPodUID == "" ||
 		nomination.Namespace != candidate.Namespace ||
-		!placement.RelocationUsesPodGroup(nomination, placement.PodGroupName(candidate)) ||
-		(nomination.Placement.ExpirationTime != nil && now.After(nomination.Placement.ExpirationTime.Time)) {
+		!placement.RelocationUsesPodGroup(nomination, placement.PodGroupName(candidate)) {
 		return false
 	}
 	switch nomination.Placement.Phase {
@@ -832,8 +834,7 @@ func hasClaimableNomination(
 	}
 	for index := range run.Status.Relocations {
 		nomination := &run.Status.Relocations[index]
-		if nominationUnavailableForClaim(nomination) ||
-			(nomination.Placement.ExpirationTime != nil && now.After(nomination.Placement.ExpirationTime.Time)) {
+		if nominationUnavailableForClaim(nomination) || executionDeadlinePassedForRun(run, now) {
 			continue
 		}
 		if inCandidateGroup(nomination) && (nomination.SchedulingRequirementsHash == "" ||
@@ -847,6 +848,10 @@ func hasClaimableNomination(
 func placementRunActive(run *repackv1alpha1.RepackRun) bool {
 	return run != nil && run.Spec.Mode == repackv1alpha1.RepackModeExecute &&
 		run.Status.Phase == repackv1alpha1.RepackRunning
+}
+
+func executionDeadlinePassedForRun(run *repackv1alpha1.RepackRun, now time.Time) bool {
+	return run != nil && run.Status.ExecutionDeadline != nil && !now.Before(run.Status.ExecutionDeadline.Time)
 }
 
 // needsNomination is true for a pod that is unscheduled, not yet nominated, and
@@ -882,7 +887,7 @@ func (n *Nominator) matchNomination(
 		if nominationUnavailableForClaim(nomination) {
 			continue
 		}
-		if nomination.Placement.ExpirationTime != nil && now.After(nomination.Placement.ExpirationTime.Time) {
+		if executionDeadlinePassedForRun(run, now) {
 			continue
 		}
 		// 1. An exact victim name has the strongest Pod identity, but it

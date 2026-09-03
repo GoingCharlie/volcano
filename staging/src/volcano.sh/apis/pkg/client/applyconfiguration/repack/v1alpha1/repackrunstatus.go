@@ -45,6 +45,8 @@ type RepackRunStatusApplyConfiguration struct {
 	Message *string `json:"message,omitempty"`
 	// StartTime is when the run first entered Running.
 	StartTime *metav1.Time `json:"startTime,omitempty"`
+	// ExecutionDeadline is the absolute deadline for the complete Execute lifecycle.
+	ExecutionDeadline *metav1.Time `json:"executionDeadline,omitempty"`
 	// CompletionTime is when the run first reached a terminal phase (TTL anchor).
 	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
 	// Plan is the immutable plan-time decision in both modes. DryRun reports what
@@ -103,6 +105,14 @@ func (b *RepackRunStatusApplyConfiguration) WithMessage(value string) *RepackRun
 // If called multiple times, the StartTime field is set to the value of the last call.
 func (b *RepackRunStatusApplyConfiguration) WithStartTime(value metav1.Time) *RepackRunStatusApplyConfiguration {
 	b.StartTime = &value
+	return b
+}
+
+// WithExecutionDeadline sets the ExecutionDeadline field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the ExecutionDeadline field is set to the value of the last call.
+func (b *RepackRunStatusApplyConfiguration) WithExecutionDeadline(value metav1.Time) *RepackRunStatusApplyConfiguration {
+	b.ExecutionDeadline = &value
 	return b
 }
 

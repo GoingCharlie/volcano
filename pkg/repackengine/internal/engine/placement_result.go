@@ -209,7 +209,7 @@ func (e *Engine) expirePlacements(ctx context.Context, run *repackv1alpha1.Repac
 	keys := map[placementexecutor.Identity]struct{}{}
 	for index := range run.Status.Relocations {
 		relocation := &run.Status.Relocations[index]
-		if placementexecutor.CanExpire(relocation, e.now()) {
+		if placementexecutor.CanExpire(run, relocation, e.now()) {
 			keys[placementexecutor.IdentityForRelocation(relocation)] = struct{}{}
 		}
 	}
@@ -229,7 +229,7 @@ func (e *Engine) expirePlacements(ctx context.Context, run *repackv1alpha1.Repac
 		expiredCount = 0
 		for index := range latest.Status.Relocations {
 			relocation := &latest.Status.Relocations[index]
-			if _, found := keys[placementexecutor.IdentityForRelocation(relocation)]; !found || !placementexecutor.CanExpire(relocation, e.now()) {
+			if _, found := keys[placementexecutor.IdentityForRelocation(relocation)]; !found || !placementexecutor.CanExpire(run, relocation, e.now()) {
 				continue
 			}
 			relocation.Placement.Phase = repackv1alpha1.PodPlacementTimedOut

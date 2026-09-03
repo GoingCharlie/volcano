@@ -139,14 +139,13 @@ type PodGroupPlacementPolicyReader interface {
 func PrepareExecuteRelocations(
 	run *repackv1alpha1.RepackRun,
 	plan *engineapi.RepackPlan,
-	nominationTTL time.Duration,
 	now time.Time,
 	policyReader PodGroupPlacementPolicyReader,
 ) error {
 	if run == nil {
 		return nil
 	}
-	relocations, err := BuildPodRelocations(plan, nominationTTL, now, policyReader)
+	relocations, err := BuildPodRelocations(plan, now, policyReader)
 	if err != nil {
 		return err
 	}
@@ -314,7 +313,6 @@ func PercentagePoints(fraction float64) int32 {
 // replacements.
 func BuildPodRelocations(
 	plan *engineapi.RepackPlan,
-	nominationTTL time.Duration,
 	now time.Time,
 	policyReader PodGroupPlacementPolicyReader,
 ) ([]repackv1alpha1.PodRelocationStatus, error) {
@@ -324,7 +322,6 @@ func BuildPodRelocations(
 	if policyReader == nil {
 		return nil, fmt.Errorf("PodGroup placement policy reader is required")
 	}
-	expirationTime := metav1.NewTime(now.Add(nominationTTL))
 	relocations := make([]repackv1alpha1.PodRelocationStatus, 0, len(plan.Moves))
 	for _, move := range plan.Moves {
 		if move == nil || move.Task == nil || move.To == move.From {
@@ -365,8 +362,7 @@ func BuildPodRelocations(
 				Phase: repackv1alpha1.PodEvictionPending,
 			},
 			Placement: repackv1alpha1.PodPlacementStatus{
-				Phase:          repackv1alpha1.PodPlacementWaitingForReplacement,
-				ExpirationTime: &expirationTime,
+				Phase: repackv1alpha1.PodPlacementWaitingForReplacement,
 			},
 		})
 	}
