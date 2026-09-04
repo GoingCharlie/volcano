@@ -130,6 +130,27 @@ func NewEngine(config *rest.Config, engineConfig Config) (*Engine, error) {
 				e.enqueue(newRun)
 			}
 		},
+		DeleteFunc: func(obj interface{}) {
+			// A Run deleted before reaching a terminal phase must release the K=1
+			// Execute slot it holds. The informer normally delivers a Delete event
+			// even when the Run never re-enters the workqueue (e.g. an operator or
+			// Run GC removes a Running Execute), so this is the authoritative
+			// cleanup point; the reconcile IsNotFound path is a second, overlapping
+			// guard for deletes that raced a queued reconcile. markExecuteDone is
+			// owner-checked, so DryRun runs and foreign names are untouched.
+			run, ok := obj.(*repackv1alpha1.RepackRun)
+			if !ok {
+				if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+					run, _ = tombstone.Obj.(*repackv1alpha1.RepackRun)
+				}
+			}
+			if run == nil {
+				return
+			}
+			if e.markExecuteDone(run.Name) {
+				e.requeueGatedRuns()
+			}
+		},
 	})
 	return e, nil
 }
