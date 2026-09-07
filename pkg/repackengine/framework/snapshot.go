@@ -85,3 +85,10 @@ type Snapshot interface {
 type PodDisruptionBudgetReader interface {
 	ListPodDisruptionBudgets() ([]*policyv1.PodDisruptionBudget, error)
 }
+
+// PodGroupAnnotationReader is an optional Snapshot capability for plugins that
+// consume PodGroup-owned extension contracts. Implementations must return a
+// copy so callers cannot mutate objects held by the scheduler cache.
+type PodGroupAnnotationReader interface {
+	PodGroupAnnotations(schedapi.JobID) (map[string]string, bool)
+}
