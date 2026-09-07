@@ -15,8 +15,9 @@ limitations under the License.
 */
 
 // Package pdbconstraint prevents Repack from planning movement of accelerator
-// Pods protected by a fresh, deterministic zero-disruption PDB. Dynamic PDB
-// allowance remains authoritative at the Kubernetes Eviction API.
+// Pods protected by a fresh, deterministic zero-disruption PDB or by a
+// zero-disruption PodGroup eviction policy. Dynamic allowance remains
+// authoritative at the Kubernetes Eviction API and workload admission hooks.
 package pdbconstraint
 
 import (
@@ -74,23 +75,67 @@ func (*pdbConstraintPlugin) OnSessionOpen(ssn *framework.Session) {
 		klog.Warningf("repack: PDB constraints unavailable; planning will continue without static PDB filtering: snapshot is unavailable")
 		return
 	}
-	reader, ok := ssn.Snapshot().(framework.PodDisruptionBudgetReader)
+
+	snapshot := ssn.Snapshot()
+	var pdbs []*policyv1.PodDisruptionBudget
+	constraintsByNamespace := make(map[string][]compiledPDBConstraint)
+	zeroDisruptionPDBCount := 0
+	reader, ok := snapshot.(framework.PodDisruptionBudgetReader)
 	if !ok {
 		klog.Warningf("repack: PDB constraints unavailable; planning will continue without static PDB filtering: snapshot does not implement PodDisruptionBudgetReader")
-		return
-	}
-	pdbs, err := reader.ListPodDisruptionBudgets()
-	if err != nil {
-		klog.Warningf("repack: PDB constraints unavailable; planning will continue without static PDB filtering: %v", err)
-		return
+	} else {
+		var err error
+		pdbs, err = reader.ListPodDisruptionBudgets()
+		if err != nil {
+			klog.Warningf("repack: PDB constraints unavailable; planning will continue without static PDB filtering: %v", err)
+			pdbs = nil
+		} else {
+			constraintsByNamespace, zeroDisruptionPDBCount = compilePDBConstraints(pdbs)
+		}
 	}
 
-	constraintsByNamespace, zeroDisruptionPDBCount := compilePDBConstraints(pdbs)
+	annotationReader, hasAnnotationReader := snapshot.(framework.PodGroupAnnotationReader)
+	if !hasAnnotationReader {
+		klog.Warningf("repack: PodGroup eviction policies unavailable; planning will continue without static eviction-policy filtering: snapshot does not implement PodGroupAnnotationReader")
+	}
+	policiesByPodGroup := make(map[schedapi.JobID]*compiledEvictionPolicy)
+	evictionPolicyCount := 0
+	invalidEvictionPolicyCount := 0
+	policyForPodGroup := func(id schedapi.JobID) *compiledEvictionPolicy {
+		if !hasAnnotationReader || id == "" {
+			return nil
+		}
+		if policy, loaded := policiesByPodGroup[id]; loaded {
+			return policy
+		}
+		annotations, found := annotationReader.PodGroupAnnotations(id)
+		if !found {
+			policiesByPodGroup[id] = nil
+			return nil
+		}
+		raw, found := annotations[evictionPolicyAnnotationKey]
+		if !found {
+			policiesByPodGroup[id] = nil
+			return nil
+		}
+		evictionPolicyCount++
+		policy, err := compileEvictionPolicy(raw)
+		if err != nil {
+			invalidEvictionPolicyCount++
+			policy = &compiledEvictionPolicy{validationError: err}
+			klog.ErrorS(err, "repack: invalid PodGroup eviction policy; PodGroup will be excluded from planning",
+				"podGroup", id,
+				"annotation", evictionPolicyAnnotationKey)
+		}
+		policiesByPodGroup[id] = policy
+		return policy
+	}
+
 	blockedTasks := make(map[schedapi.TaskID]blockedTaskInfo)
 	blockedPodGroups := make(map[schedapi.JobID]struct{})
 	targetTaskCount := 0
 	seenTasks := make(map[schedapi.TaskID]struct{})
-	for _, node := range ssn.Snapshot().Nodes() {
+	for _, node := range snapshot.Nodes() {
 		if node == nil {
 			continue
 		}
@@ -107,6 +152,7 @@ func (*pdbConstraintPlugin) OnSessionOpen(ssn *framework.Session) {
 				continue
 			}
 			targetTaskCount++
+			policy := policyForPodGroup(task.Job)
 			if info, blocked := blockingPDB(task, constraintsByNamespace); blocked {
 				blockedTasks[key] = info
 				if task.Job != "" {
@@ -117,6 +163,20 @@ func (*pdbConstraintPlugin) OnSessionOpen(ssn *framework.Session) {
 					"pod", task.Pod.Namespace+"/"+task.Pod.Name,
 					"podGroup", task.Job,
 					"pdb", info.PDBNamespace+"/"+info.PDBName)
+				continue
+			}
+			if info, blocked := blockingEvictionPolicy(task, policy); blocked {
+				blockedTasks[key] = blockedTaskInfo{}
+				if task.Job != "" {
+					blockedPodGroups[task.Job] = struct{}{}
+				}
+				klog.V(5).InfoS("repack: task excluded by PodGroup eviction policy",
+					"reason", info.reason,
+					"pod", task.Pod.Namespace+"/"+task.Pod.Name,
+					"podGroup", task.Job,
+					"subgroup", info.subgroup,
+					"modelServing", task.Pod.Labels[modelServingNameLabel],
+					"servingGroup", task.Pod.Labels[modelServingGroupNameLabel])
 			}
 		}
 	}
@@ -125,6 +185,8 @@ func (*pdbConstraintPlugin) OnSessionOpen(ssn *framework.Session) {
 		"run", runName(ssn),
 		"pdbCount", len(pdbs),
 		"zeroDisruptionPDBCount", zeroDisruptionPDBCount,
+		"evictionPolicyCount", evictionPolicyCount,
+		"invalidEvictionPolicyCount", invalidEvictionPolicyCount,
 		"targetTaskCount", targetTaskCount,
 		"blockedTaskCount", len(blockedTasks),
 		"blockedPodGroupCount", len(blockedPodGroups))

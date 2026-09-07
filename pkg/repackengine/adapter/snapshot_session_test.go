@@ -57,9 +57,12 @@ func TestSessionSnapshot_PodGroupView(t *testing.T) {
 		Priority:        10,
 		Tasks:           tasks,
 		TaskStatusIndex: map[schedapi.TaskStatus]schedapi.TasksMap{schedapi.Running: tasks},
-		PodGroup: &schedapi.PodGroup{PodGroup: schedulingapi.PodGroup{Spec: schedulingapi.PodGroupSpec{
-			SubGroupPolicy: []schedulingapi.SubGroupPolicySpec{{Name: "workers"}},
-		}}},
+		PodGroup: &schedapi.PodGroup{PodGroup: schedulingapi.PodGroup{
+			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{"volcano.sh/eviction-policy": "policy"}},
+			Spec: schedulingapi.PodGroupSpec{
+				SubGroupPolicy: []schedulingapi.SubGroupPolicySpec{{Name: "workers"}},
+			},
+		}},
 	}
 	ssn := &schedframework.Session{Jobs: map[schedapi.JobID]*schedapi.JobInfo{"ns/big": ji}}
 	snap := NewSessionSnapshot(ssn, gpu, nil)
@@ -79,6 +82,17 @@ func TestSessionSnapshot_PodGroupView(t *testing.T) {
 	}
 	if snap.PodGroupUsesSubGroupPolicy("ns/unknown") {
 		t.Error("unknown PodGroup must not use SubGroup policy")
+	}
+	annotations, found := snap.PodGroupAnnotations("ns/big")
+	if !found || annotations["volcano.sh/eviction-policy"] != "policy" {
+		t.Fatalf("PodGroup annotations=%v found=%t, want eviction policy", annotations, found)
+	}
+	annotations["volcano.sh/eviction-policy"] = "mutated"
+	if got := ji.PodGroup.Annotations["volcano.sh/eviction-policy"]; got != "policy" {
+		t.Fatalf("PodGroupAnnotations must return a defensive copy, cached value=%q", got)
+	}
+	if _, found := snap.PodGroupAnnotations("ns/unknown"); found {
+		t.Fatal("unknown PodGroup must not report annotations")
 	}
 }
 
