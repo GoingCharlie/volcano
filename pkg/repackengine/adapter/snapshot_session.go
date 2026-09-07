@@ -23,6 +23,7 @@ package adapter
 import (
 	"context"
 	"fmt"
+	"maps"
 
 	v1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -53,6 +54,7 @@ type SessionSnapshot struct {
 
 var _ framework.Snapshot = (*SessionSnapshot)(nil)
 var _ framework.PodDisruptionBudgetReader = (*SessionSnapshot)(nil)
+var _ framework.PodGroupAnnotationReader = (*SessionSnapshot)(nil)
 
 // NewSessionSnapshot wraps a Session for the given target resource. scope gates
 // drain targets (nil = all in scope); it does NOT filter the receiver set.
@@ -92,6 +94,19 @@ func (s *SessionSnapshot) ListPodDisruptionBudgets() ([]*policyv1.PodDisruptionB
 		return nil, fmt.Errorf("scheduler PDB informer is unavailable")
 	}
 	return s.pdbLister.List(labels.Everything())
+}
+
+// PodGroupAnnotations returns a defensive copy of the PodGroup annotations
+// already present in the scheduler Session.
+func (s *SessionSnapshot) PodGroupAnnotations(id schedapi.JobID) (map[string]string, bool) {
+	if s == nil || s.ssn == nil {
+		return nil, false
+	}
+	job, found := s.ssn.Jobs[id]
+	if !found || job == nil || job.PodGroup == nil {
+		return nil, false
+	}
+	return maps.Clone(job.PodGroup.Annotations), true
 }
 
 // FeasibleRelocation simulates evicting `victims` and greedily relocating them
