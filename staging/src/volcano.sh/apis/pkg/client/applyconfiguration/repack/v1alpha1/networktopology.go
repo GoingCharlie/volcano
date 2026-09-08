@@ -31,8 +31,7 @@ import (
 // The tier identifier is mutually exclusive by construction: configure exactly
 // one of HyperNodeTier (numeric, matching HyperNode.Spec.Tier) or
 // HyperNodeTierName (matching HyperNode.Spec.TierName). The exclusivity is
-// enforced at the apiserver with a CEL XValidation on this struct (there is no
-// repo precedent for struct-level XValidation; verify via make manifests + e2e).
+// enforced at the apiserver with a CEL XValidation on this struct.
 type NetworkTopologyApplyConfiguration struct {
 	// HyperNodeTier is the target HyperNode tier (numeric), matching
 	// HyperNode.Spec.Tier. Mutually exclusive with HyperNodeTierName; exactly one
