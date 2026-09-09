@@ -39,7 +39,6 @@ import (
 	enginecache "volcano.sh/volcano/pkg/repackengine/cache"
 	engineconf "volcano.sh/volcano/pkg/repackengine/conf"
 	enginestatus "volcano.sh/volcano/pkg/repackengine/status"
-	"volcano.sh/volcano/pkg/scheduler/conf"
 )
 
 type Config = engineconf.Config
@@ -54,6 +53,13 @@ type Engine struct {
 	// Explicit command/programmatic overrides take precedence over repack-conf.
 	actionsExplicit bool
 	pluginsExplicit bool
+	// runtimeConfig is the immutable last-known-good view assembled from the
+	// scheduler and Repack configuration files. Reloads are serialized so two
+	// ConfigMap volume events cannot publish out of order.
+	runtimeConfigMutex sync.RWMutex
+	reloadConfigMutex  sync.Mutex
+	runtimeConfig      *runtimeConfiguration
+	configWatchers     []configFileWatcher
 
 	informerFactory         vcinformers.SharedInformerFactory
 	repackRunLister         repacklisters.RepackRunLister
@@ -64,8 +70,6 @@ type Engine struct {
 	statusStore             *enginestatus.Store
 	now                     func() time.Time
 
-	tiers          []conf.Tier
-	configurations []conf.Configuration
 	// activeExecuteRunName is the Execute run currently holding the K=1 slot
 	// ("" = none); lastExecuteFinishTime is when this engine last finished an Execute.
 	// These values bridge informer-cache propagation and are protected by
@@ -91,6 +95,10 @@ type Engine struct {
 func NewEngine(config *rest.Config, engineConfig Config) (*Engine, error) {
 	actionsExplicit, pluginsExplicit := len(engineConfig.Actions) > 0, len(engineConfig.Plugins) > 0
 	engineconf.ApplyDefaults(&engineConfig)
+	configWatchers, err := newConfigFileWatchers(engineConfig)
+	if err != nil {
+		return nil, err
+	}
 	volcanoClient := vcclientset.NewForConfigOrDie(config)
 	informerFactory := vcinformers.NewSharedInformerFactory(volcanoClient, engineConfig.ResyncPeriod)
 	informer := informerFactory.Repack().V1alpha1().RepackRuns()
@@ -104,6 +112,7 @@ func NewEngine(config *rest.Config, engineConfig Config) (*Engine, error) {
 		config:                  engineConfig,
 		actionsExplicit:         actionsExplicit,
 		pluginsExplicit:         pluginsExplicit,
+		configWatchers:          configWatchers,
 		informerFactory:         informerFactory,
 		repackRunLister:         informer.Lister(),
 		repackRunInformerSynced: informer.Informer().HasSynced,
@@ -155,18 +164,19 @@ func NewEngine(config *rest.Config, engineConfig Config) (*Engine, error) {
 	return e, nil
 }
 
-// Run loads the shared scheduler config and the independent Repack config,
-// starts the cache + informer, and serves RepackRun events with a single worker
-// until ctx is cancelled.
+// Run loads and watches the shared scheduler config and the independent Repack
+// config, starts the cache + informer, and serves RepackRun events with a single
+// worker until ctx is cancelled.
 func (e *Engine) Run(ctx context.Context) {
 	defer utilruntime.HandleCrash()
 	defer e.workQueue.ShutDown()
+	defer e.closeConfigWatchers()
 	if e.eventBroadcaster != nil {
 		defer e.eventBroadcaster.Shutdown()
 	}
 
 	if err := e.loadConf(); err != nil {
-		klog.ErrorS(err, "repack: load scheduler conf")
+		klog.ErrorS(err, "repack: load configuration")
 		return // fail closed: never plan/evict without the scheduler's filter stack
 	}
 	e.informerFactory.Start(ctx.Done())
@@ -176,8 +186,18 @@ func (e *Engine) Run(ctx context.Context) {
 		return
 	}
 	e.recoverOrphans(ctx) // fail runs left Running by a crashed predecessor
+	var configWatcherWorkers sync.WaitGroup
+	for _, watched := range e.configWatchers {
+		configWatcherWorkers.Add(1)
+		go func(watched configFileWatcher) {
+			defer configWatcherWorkers.Done()
+			e.watchConfig(ctx, watched)
+		}(watched)
+	}
+	runtimeConfig := e.currentRuntimeConfiguration()
 	klog.V(3).InfoS("repack-engine started (event-driven)",
-		"plugins", configuredPluginNames(e.config.Plugins),
+		"configGeneration", runtimeConfig.generation,
+		"plugins", configuredPluginNames(runtimeConfig.plugins),
 		"defaultResource", e.config.DefaultResource, "cooldown", e.config.Cooldown,
 		"executionTimeout", e.config.ExecutionTimeout, "resyncPeriod", e.config.ResyncPeriod)
 	// Single worker: Execute runs serialize naturally (one reconcile at a time).
@@ -193,5 +213,6 @@ func (e *Engine) Run(ctx context.Context) {
 	// observe ctx cancellation before shutting down the event broadcaster.
 	e.workQueue.ShutDown()
 	worker.Wait()
+	configWatcherWorkers.Wait()
 	klog.V(3).InfoS("repack-engine shut down")
 }

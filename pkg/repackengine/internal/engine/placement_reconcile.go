@@ -44,7 +44,7 @@ import (
 	schedframework "volcano.sh/volcano/pkg/scheduler/framework"
 )
 
-func (e *Engine) reconcilePlacement(ctx context.Context, run *repackv1alpha1.RepackRun) engineframework.RuntimeResult {
+func (e *Engine) reconcilePlacement(ctx context.Context, run *repackv1alpha1.RepackRun, configuration *runtimeConfiguration) engineframework.RuntimeResult {
 	if run == nil {
 		return engineframework.RuntimeResult{}
 	}
@@ -74,7 +74,7 @@ func (e *Engine) reconcilePlacement(ctx context.Context, run *repackv1alpha1.Rep
 			}
 			return engineframework.RuntimeResult{Requeue: true}
 		}
-		return e.finishPlacement(ctx, run)
+		return e.finishPlacement(ctx, run, configuration)
 	}
 	pending := placementexecutor.Candidates(run)
 	if len(pending) == 0 {
@@ -87,7 +87,7 @@ func (e *Engine) reconcilePlacement(ctx context.Context, run *repackv1alpha1.Rep
 	}
 
 	targetResource := engineconf.ResolveResource(run, e.config.DefaultResource)
-	schedulerSession := e.clusterCache.OpenSession(e.tiers, e.configurations)
+	schedulerSession := e.clusterCache.OpenSession(configuration.tiers, configuration.configurations)
 	defer schedframework.CloseSessionReadOnly(schedulerSession)
 	scope, err := enginescope.NewMatcher(run.Spec.Scope, adapter.SessionGangScopeLookup(schedulerSession))
 	if err != nil {

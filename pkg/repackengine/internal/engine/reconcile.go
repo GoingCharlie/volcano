@@ -144,6 +144,7 @@ func (e *Engine) reconcile(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
+	runtimeConfig := e.currentRuntimeConfiguration()
 	if desired, found := e.pendingTerminalStatus(name); found {
 		work := run.DeepCopy()
 		desired.DeepCopyInto(&work.Status)
@@ -155,8 +156,8 @@ func (e *Engine) reconcile(ctx context.Context, name string) error {
 				e.requeueGatedRuns()
 			}
 		}
-		result := engineframework.RunActions(e.config.Actions, &engineframework.ActionContext{
-			Context: ctx, Run: work, Runtime: e.actionRuntime(),
+		result := engineframework.RunActions(runtimeConfig.actions, &engineframework.ActionContext{
+			Context: ctx, Run: work, Runtime: e.actionRuntime(runtimeConfig),
 		})
 		return result.Err
 	}
@@ -219,7 +220,7 @@ func (e *Engine) reconcile(ctx context.Context, name string) error {
 		klog.V(3).InfoS("repack: Execute slot acquired", "run", work.Name, "cooldown", e.config.Cooldown)
 	}
 	releaseExecuteSlot := work.Spec.Mode == repackv1alpha1.RepackModeExecute && stage != enginestatus.StageCleanup
-	actionCtx := &engineframework.ActionContext{Context: ctx, Run: work, Runtime: e.actionRuntime()}
+	actionCtx := &engineframework.ActionContext{Context: ctx, Run: work, Runtime: e.actionRuntime(runtimeConfig)}
 	defer func() {
 		if releaseExecuteSlot && !actionCtx.ExecuteSlotHeld() {
 			if e.markExecuteDone(work.Name) {
@@ -227,7 +228,7 @@ func (e *Engine) reconcile(ctx context.Context, name string) error {
 			}
 		}
 	}()
-	result := engineframework.RunActions(e.config.Actions, actionCtx)
+	result := engineframework.RunActions(runtimeConfig.actions, actionCtx)
 	if result.Requeue {
 		e.workQueue.Add(work.Name)
 	}

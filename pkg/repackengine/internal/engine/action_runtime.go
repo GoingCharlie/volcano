@@ -43,14 +43,20 @@ import (
 
 // actionRuntime adapts controller infrastructure and durable executors to the
 // framework.Runtime port. Workflow ordering deliberately remains in the Action.
-type actionRuntime struct{ engine *Engine }
+type actionRuntime struct {
+	engine        *Engine
+	configuration *runtimeConfiguration
+}
 
 var _ engineframework.Runtime = (*actionRuntime)(nil)
 
-func (e *Engine) actionRuntime() engineframework.Runtime { return &actionRuntime{engine: e} }
+func (e *Engine) actionRuntime(configuration *runtimeConfiguration) engineframework.Runtime {
+	return &actionRuntime{engine: e, configuration: configuration}
+}
 
 func (r *actionRuntime) OpenPlanningCycle(ctx context.Context, run *repackv1alpha1.RepackRun) (*engineframework.PlanningCycle, error) {
 	e := r.engine
+	configuration := r.configuration
 	targetResource := engineconf.ResolveResource(run, e.config.DefaultResource)
 	if targetResource == "" {
 		return nil, engineframework.NewActionError(state.ReasonInvalidConfiguration,
@@ -60,15 +66,15 @@ func (r *actionRuntime) OpenPlanningCycle(ctx context.Context, run *repackv1alph
 		return nil, engineframework.NewActionError(state.ReasonInvalidConfiguration,
 			fmt.Errorf("target resource %q is not supported; only fully-qualified extended resources can be defragmented", targetResource))
 	}
-	actions := e.config.Actions
+	actions := configuration.actions
 	if len(actions) == 0 {
 		actions = engineframework.DefaultActions()
 	}
-	if err := engineconf.ValidatePipeline(actions, e.config.Plugins); err != nil {
+	if err := engineconf.ValidatePipeline(actions, configuration.plugins); err != nil {
 		return nil, engineframework.NewActionError(state.ReasonInvalidConfiguration, err)
 	}
 
-	schedulerSession := e.clusterCache.OpenSession(e.tiers, e.configurations)
+	schedulerSession := e.clusterCache.OpenSession(configuration.tiers, configuration.configurations)
 	closed := false
 	closeCycle := func() {
 		if closed {
@@ -104,12 +110,12 @@ func (r *actionRuntime) OpenPlanningCycle(ctx context.Context, run *repackv1alph
 		LimitPodGroups:            hasPodGroupLimit,
 		LimitResource:             hasResourceLimit,
 		PinnedTasks:               pinnedTasks,
-	}, e.config.Plugins)
+	}, configuration.plugins)
 	closePlanning := func() {
 		engineframework.CloseSession(ssn)
 		closeCycle()
 	}
-	if err := engineconf.ValidateSession(actions, e.config.Plugins, ssn); err != nil {
+	if err := engineconf.ValidateSession(actions, configuration.plugins, ssn); err != nil {
 		closePlanning()
 		return nil, engineframework.NewActionError(state.ReasonInvalidConfiguration, err)
 	}
@@ -203,7 +209,7 @@ func (r *actionRuntime) ReconcilePlacement(ctx context.Context, run *repackv1alp
 	if err := e.releasePlacementLeases(ctx, run, groupsToRelease); err != nil {
 		return runtimeError(fmt.Errorf("release unused placement leases before placement recovery: %w", err))
 	}
-	return e.reconcilePlacement(ctx, run)
+	return e.reconcilePlacement(ctx, run, r.configuration)
 }
 
 func (r *actionRuntime) CleanupPlacement(ctx context.Context, run *repackv1alpha1.RepackRun) error {

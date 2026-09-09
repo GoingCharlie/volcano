@@ -36,7 +36,7 @@ import (
 	schedframework "volcano.sh/volcano/pkg/scheduler/framework"
 )
 
-func (e *Engine) finishPlacement(ctx context.Context, run *repackv1alpha1.RepackRun) engineframework.RuntimeResult {
+func (e *Engine) finishPlacement(ctx context.Context, run *repackv1alpha1.RepackRun, configuration *runtimeConfiguration) engineframework.RuntimeResult {
 	placementTimedOut := false
 	resultSnapshotUnavailable := false
 	for index := range run.Status.Relocations {
@@ -51,7 +51,7 @@ func (e *Engine) finishPlacement(ctx context.Context, run *repackv1alpha1.Repack
 		// plan benefit while workload demand may be temporarily absent.
 		placementexecutor.MarkBenefitUnverified(run)
 	} else {
-		schedulerSession := e.clusterCache.OpenSession(e.tiers, e.configurations)
+		schedulerSession := e.clusterCache.OpenSession(configuration.tiers, configuration.configurations)
 		nodes := adapter.NewSessionSnapshot(schedulerSession, targetResource, nil).Nodes()
 		visible := placementexecutor.BindingsVisible(nodes, run.Status.Relocations)
 		if !visible {
