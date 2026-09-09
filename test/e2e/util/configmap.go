@@ -25,15 +25,17 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 )
 
 type ConfigMapCase struct {
 	NameSpace string
 	Name      string // configmap.name
 
-	startTs  time.Time // start timestamp
-	undoData map[string]string
-	ocm      *v1.ConfigMap
+	startTs             time.Time // start timestamp
+	undoData            map[string]string
+	ocm                 *v1.ConfigMap
+	refreshPodSelectors []string
 }
 
 func NewConfigMapCase(ns, name string) *ConfigMapCase {
@@ -41,8 +43,18 @@ func NewConfigMapCase(ns, name string) *ConfigMapCase {
 		NameSpace: ns,
 		Name:      name,
 
-		undoData: make(map[string]string),
+		undoData:            make(map[string]string),
+		refreshPodSelectors: []string{"app=volcano-scheduler"},
 	}
+}
+
+// WithRefreshPodSelectors overrides the Pods whose annotations are touched
+// after a ConfigMap update. Updating Pod metadata makes kubelet refresh mounted
+// ConfigMaps promptly. The default remains app=volcano-scheduler for backwards
+// compatibility with existing scheduler E2E cases.
+func (c *ConfigMapCase) WithRefreshPodSelectors(selectors ...string) *ConfigMapCase {
+	c.refreshPodSelectors = append([]string(nil), selectors...)
+	return c
 }
 
 // ChangeBy call fn and update configmap by changed
@@ -58,17 +70,7 @@ func (c *ConfigMapCase) ChangeBy(fn func(data map[string]string) (changed bool, 
 		gomega.Expect(err).NotTo(gomega.HaveOccurred())
 		c.ocm, c.undoData = cm, changedBefore
 
-		// add pod/volcano-scheduler.annotation to update Mounted-ConfigMaps immediately
-		schedulerPods, err := KubeClient.CoreV1().Pods("volcano-system").List(context.TODO(), metav1.ListOptions{LabelSelector: "app=volcano-scheduler"})
-		gomega.Expect(err).NotTo(gomega.HaveOccurred())
-		for _, scheduler := range schedulerPods.Items {
-			if scheduler.Annotations == nil {
-				scheduler.Annotations = make(map[string]string)
-			}
-			scheduler.Annotations["refreshts"] = time.Now().Format("060102150405.000")
-			_, err = KubeClient.CoreV1().Pods("volcano-system").Update(context.TODO(), &scheduler, metav1.UpdateOptions{})
-			gomega.Expect(err).NotTo(gomega.HaveOccurred())
-		}
+		gomega.Expect(c.refreshMountedConfigMaps()).To(gomega.Succeed())
 		c.startTs = time.Now()
 	}
 	return nil
@@ -90,16 +92,34 @@ func (c *ConfigMapCase) UndoChanged() error {
 	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 	c.ocm = cm
 
-	// add pod/volcano-scheduler.annotation to update Mounted-ConfigMaps immediately
-	schedulerPods, err := KubeClient.CoreV1().Pods("volcano-system").List(context.TODO(), metav1.ListOptions{LabelSelector: "app=volcano-scheduler"})
-	gomega.Expect(err).NotTo(gomega.HaveOccurred())
-	for _, scheduler := range schedulerPods.Items {
-		if scheduler.Annotations == nil {
-			scheduler.Annotations = make(map[string]string)
+	gomega.Expect(c.refreshMountedConfigMaps()).To(gomega.Succeed())
+	return nil
+}
+
+func (c *ConfigMapCase) refreshMountedConfigMaps() error {
+	refreshTimestamp := time.Now().Format("060102150405.000")
+	for _, selector := range c.refreshPodSelectors {
+		pods, err := KubeClient.CoreV1().Pods(c.NameSpace).List(context.TODO(), metav1.ListOptions{LabelSelector: selector})
+		if err != nil {
+			return err
 		}
-		scheduler.Annotations["refreshts"] = time.Now().Format("060102150405.000")
-		_, err = KubeClient.CoreV1().Pods("volcano-system").Update(context.TODO(), &scheduler, metav1.UpdateOptions{})
-		gomega.Expect(err).NotTo(gomega.HaveOccurred())
+		for i := range pods.Items {
+			podName := pods.Items[i].Name
+			if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				pod, err := KubeClient.CoreV1().Pods(c.NameSpace).Get(context.TODO(), podName, metav1.GetOptions{})
+				if err != nil {
+					return err
+				}
+				if pod.Annotations == nil {
+					pod.Annotations = make(map[string]string)
+				}
+				pod.Annotations["refreshts"] = refreshTimestamp
+				_, err = KubeClient.CoreV1().Pods(c.NameSpace).Update(context.TODO(), pod, metav1.UpdateOptions{})
+				return err
+			}); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }

@@ -36,7 +36,7 @@ import (
 // planned receiver: the plan is the selection, so the engine reads no live Pod
 // and runs no feasibility recompute. The scheduler validates the target when it
 // binds, and any drift is recorded on the relocation.
-func (e *Engine) reconcilePlacement(ctx context.Context, run *repackv1alpha1.RepackRun) engineframework.RuntimeResult {
+func (e *Engine) reconcilePlacement(ctx context.Context, run *repackv1alpha1.RepackRun, configuration *runtimeConfiguration) engineframework.RuntimeResult {
 	if run == nil {
 		return engineframework.RuntimeResult{}
 	}
@@ -66,7 +66,7 @@ func (e *Engine) reconcilePlacement(ctx context.Context, run *repackv1alpha1.Rep
 			}
 			return engineframework.RuntimeResult{Requeue: true}
 		}
-		return e.finishPlacement(ctx, run)
+		return e.finishPlacement(ctx, run, configuration)
 	}
 	pending := placementexecutor.Candidates(run)
 	if len(pending) == 0 {

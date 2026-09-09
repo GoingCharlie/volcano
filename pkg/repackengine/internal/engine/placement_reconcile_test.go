@@ -85,7 +85,7 @@ func TestReconcilePlacementNominatesThePlannedNodeVerbatim(t *testing.T) {
 	)
 	engine, client := placementEngine(run)
 
-	result := engine.reconcilePlacement(context.Background(), run)
+	result := engine.reconcilePlacement(context.Background(), run, engine.currentRuntimeConfiguration())
 	if result.Err != nil {
 		t.Fatalf("reconcilePlacement() error = %v", result.Err)
 	}
@@ -106,7 +106,7 @@ func TestReconcilePlacementLeavesTheNominationToTheController(t *testing.T) {
 	run := placementRun(settled, gatedReplacement("gA", "pending", "target-pending"))
 	engine, client := placementEngine(run)
 
-	if result := engine.reconcilePlacement(context.Background(), run); result.Err != nil {
+	if result := engine.reconcilePlacement(context.Background(), run, engine.currentRuntimeConfiguration()); result.Err != nil {
 		t.Fatalf("reconcilePlacement() error = %v", result.Err)
 	}
 
@@ -139,7 +139,7 @@ func TestReconcilePlacementWaitsForClaimedReplacements(t *testing.T) {
 	}
 	engine, client := placementEngine(run)
 
-	result := engine.reconcilePlacement(context.Background(), run)
+	result := engine.reconcilePlacement(context.Background(), run, engine.currentRuntimeConfiguration())
 	if result.Err != nil {
 		t.Fatalf("reconcilePlacement() error = %v", result.Err)
 	}
@@ -161,7 +161,7 @@ func TestReconcilePlacementCapsWaitingAtExecutionDeadline(t *testing.T) {
 	run.Status.ExecutionDeadline = &deadline
 	engine, _ := placementEngine(run)
 
-	result := engine.reconcilePlacement(context.Background(), run)
+	result := engine.reconcilePlacement(context.Background(), run, engine.currentRuntimeConfiguration())
 	if result.Err != nil {
 		t.Fatalf("reconcilePlacement() error = %v", result.Err)
 	}
