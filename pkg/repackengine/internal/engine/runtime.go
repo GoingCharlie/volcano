@@ -148,7 +148,7 @@ func NewEngine(config *rest.Config, engineConfig Config) (*Engine, error) {
 				return
 			}
 			if e.markExecuteDone(run.Name) {
-				e.requeueGatedRuns()
+				e.requeueGatedRuns(run.Name)
 			}
 		},
 	})
