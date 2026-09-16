@@ -52,7 +52,6 @@ import (
 	_ "volcano.sh/volcano/pkg/repackengine/plugins/nodeconsolidation"
 	_ "volcano.sh/volcano/pkg/repackengine/plugins/pdbconstraint"
 	_ "volcano.sh/volcano/pkg/repackengine/plugins/repackbudget"
-	_ "volcano.sh/volcano/pkg/repackengine/plugins/victimorder"
 	_ "volcano.sh/volcano/pkg/repackengine/plugins/workloaddisruption"
 	_ "volcano.sh/volcano/pkg/repackengine/plugins/workloadscope"
 )

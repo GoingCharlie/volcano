@@ -28,7 +28,6 @@ data:
         arguments:
           gangBreachesWeight: 8
           damagedResourceWeight: 6
-      - name: victimorder
       - name: binpack
 ---
 apiVersion: v1
