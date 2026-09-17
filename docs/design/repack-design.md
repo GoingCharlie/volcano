@@ -326,11 +326,13 @@ Plugin 回调可以保持简洁，但策略语义必须由对应 Plugin 拥有�
 | `workloadscope` | 工作负载授权边界 | 不应用用户工作负载 Scope；合法 PodGroup 身份基础边界仍生效 |
 | `pdbconstraint` | 过滤确定性零中断 PDB 保护的目标资源 Pod | 规划期不预过滤，PDB 仍由 Execute 的 Eviction API 最终校验 |
 | `repackbudget` | `maxPerRun` 候选过滤 | 不应用对应预算 |
-| `nodeconsolidation` | 提供部分占用 Node Unit | 当前无 Domain，Action 配置校验失败 |
+| `nodeconsolidation` | 提供部分占用 Node Unit；victim 模拟顺序：候选节点数升序 | 当前无 Domain，Action 配置校验失败；候选数键一并失去，顺序让给链上其他排序 Plugin 与框架 UID 兜底 |
+| `networktopologyaware` | 把 `RepackRun.spec.networkTopology` 表达为 HyperNode 块约束：块推进/块分布打分、块数准入、receiver 块保护；复用 Node 单元，不新增排空单元 | `networkTopology` 已设置时块语义静默失效；未设置时本就零效果 |
 | `workloaddisruption` | 工作负载数、迁移资源、Pod 数评分 | 关闭通用中断偏好 |
 | `gangdisruption` | Gang breach、受损资源和未来 receiver Gang 成本 | 关闭 Gang 偏好 |
-| `victimorder` | victim 模拟顺序：候选节点数升序，同数按目标资源降序 | 失去候选数与 FFD 两个键，顺序退回框架的 UID 兜底 |
-| `binpack` | 稳定节点优先和 best-fit | 关闭 receiver 侧装箱质量策略 |
+| `binpack` | victim 模拟顺序：目标资源降序（FFD）；稳定节点优先和 best-fit | 关闭 receiver 侧装箱质量策略与目标资源降序键 |
+
+`networktopologyaware` 的块语义见 [HyperNode 拓扑感知设计](./repack-hypernode-aware.md) §4.1.3。
 
 空/满节点裁剪、接收总容量预检、victim 顺序的 UID 兜底全序和完整 Scheduler 校验是 Planner 不可关闭的正确性边界。
 
@@ -349,6 +351,7 @@ plugins:
   - name: pdbconstraint
   - name: repackbudget
   - name: nodeconsolidation
+  - name: networktopologyaware
   - name: workloaddisruption
     arguments:
       affectedPodGroupsWeight: 10
@@ -358,19 +361,18 @@ plugins:
     arguments:
       gangBreachesWeight: 8
       damagedResourceWeight: 6
-  - name: victimorder
   - name: binpack
 ```
 
 权重必须为非负整数，`0` 关闭对应评分项。未知字段、未知参数、小数和负数在启动阶段失败。命令行显式指定的 actions/plugins 优先于配置文件。
 
-`victimorder` 的四个布尔参数默认均为 `true`：`nodeAffinity`、`taints`、`cordon` 选择计入候选数的静态节点侧因素，`resourceRequests` 开关目标资源降序键。三个节点侧因素全关时只剩资源键；`resourceRequests` 关闭时资源键弃权，平局让给后续插件与框架 UID 兜底。候选数定义为「Session 内除 victim 自身所在节点外，允许该 Pod 调度的节点数」，复用调度器同源的 `nodeaffinity.GetRequiredNodeAffinity(...).Match(...)` 与 `corev1.FindMatchingUntoleratedTaint`，因此与真实 Filter 结果一致，且不产生任何 predicate 求值开销（不检查剩余资源，故是真实候选数的下界）。Pod 之间亲和/反亲和、拓扑分布、hostPorts 不在范围内。节点全集含空节点与满节点（它们被 Node Unit 的裁剪排除在两侧之外），这一项对所有 victim 是均匀噪声，但确实使「下界」这一说法在本插件内部不再严格成立；把 `drain.eligibleReceiverNodes` 提升为 receiver 全集是后续工作。
+`nodeconsolidation` 的三个布尔参数默认均为 `true`：`nodeAffinity`、`taints`、`cordon` 选择计入候选数的静态节点侧因素。三者全关时候选数键弃权，平局让给链上后续 Plugin 与框架 UID 兜底。候选数定义为「Session 内除 victim 自身所在节点外，通过这三项静态因素、允许该 Pod 调度的节点数」，复用调度器同源的 `nodeaffinity.GetRequiredNodeAffinity(...).Match(...)` 与 `corev1.FindMatchingUntoleratedTaint`，因此对这三项的判定与真实 Filter 同源一致，且不产生任何 predicate 求值开销。Pod 之间亲和/反亲和、拓扑分布、hostPorts 与剩余容量都不在范围内，空节点与满节点也因此被计入（对所有 victim 是均匀噪声）。这三项是能调度的必要条件而非充分条件，只数通过必要条件的节点，得到的必然是真实候选集合的超集，故候选数是真实候选数的上界：真正被容量或 Pod 间因素约束的 Pod 只是「看起来宽松」，会被排到比应得的更后面。把 `drain.eligibleReceiverNodes` 提升为 receiver 全集能缩小这一偏差（Pod 间因素仍被忽略，故不能消除），是后续工作。
 
-方向性是不对称的，这是本插件可安全启用的原因：候选数低估只会让某个 Pod 被排得更靠前（次优，无损）；高估则可能让一个本可行的 unit 被判为不可行，并被 `stuckUnits` 在整个 pass 内缓存为永久卡住。因此宁可少算。
+方向性是不对称的，代价落在效果而非正确性上：候选数低估只会让某个 Pod 被排得更靠前（次优，无损）；高估则让本应早模拟的 Pod 排到后面，贪心模拟可能因此凑不出 receiver，该 unit 被判为不可行并被 `stuckUnits` 在本次 pass 内缓存、下一 pass 重试。本插件落在高估一侧，所以它提供的是排序质量，可行性保证始终来自 Scheduler 模拟。
 
-victim 顺序的两个键——候选数升序与目标资源降序——同属这一个比较器，因此不涉及任何插件间优先级，配置顺序重排不会改变模拟顺序。候选数键只在两侧都已知时给出意见，否则让位给目标资源键。
+victim 顺序的两个键分属两个 Plugin：`nodeconsolidation` 提供候选数升序，`binpack` 提供目标资源降序。两者各自通过 `AddVictimOrderFn` 注册自己的比较器，链上顺序即 Plugin 列表顺序，因此调换 `nodeconsolidation` 与 `binpack` 的位置就会改变主次键，默认列表让候选数键领先。候选数键只在两侧都已知时给出意见，否则让位给链上的下一个比较器。候选数键与 Domain 同属 `nodeconsolidation`：它是该产品的模拟顺序启发式，代价是这个必选 Plugin 因此带上了配置项。
 
-框架侧另有一条不可关闭的保证：victim 由遍历 map 收集而来（`VictimsOf` 遍历 `NodeInfo.Tasks`），若链上所有比较器都弃权，`sort.SliceStable` 会保留那次 map 迭代恰好给出的顺序，使同样的集群状态产生不可复现的计划。因此 `OrderVictims` 在链尾追加一个 task UID 兜底键，任何插件组合下 victim 顺序都是全序。这也意味着移除 `victimorder` 不会让顺序变得随机，只是失去策略键。
+框架侧另有一条不可关闭的保证：victim 由遍历 map 收集而来（`VictimsOf` 遍历 `NodeInfo.Tasks`），若链上所有比较器都弃权，`sort.SliceStable` 会保留那次 map 迭代恰好给出的顺序，使同样的集群状态产生不可复现的计划。因此 `OrderVictims` 在链尾追加一个 task UID 兜底键，任何插件组合下 victim 顺序都是全序。这也意味着候选数键失效（三个参数全关，或该 Plugin 不在列表中）不会让顺序变得随机，只是失去策略键。
 
 ## 8. Lazy Drain Planner 详细设计
 
@@ -708,7 +710,7 @@ Repack 的 RBAC 遵循最小权限：Engine 只获取规划所需资源、更新
 
 - API：碎片率、计划聚合、Gang 受损模型和字段转换；
 - Framework：配置顺序即优先级、AND/Union/短路、Capability、整数权重和评分范围；
-- Plugin：Scope、确定性零中断 PDB、预算、Node Domain、中断评分、Gang、静态候选数、binpack；
+- Plugin：Scope、确定性零中断 PDB、预算、Node Domain 与静态候选数、HyperNode 块约束、中断评分、Gang、binpack；
 - Planner：节点预分类、容量预检、候选顺序、完整模拟、增量状态和规模 benchmark；
 - Engine：gate、status、Eviction journal、规划与驱逐的 context cancellation、worker 优雅退出和终态收益；
 - Controller：replacement 匹配、PodGroup 代际、gate、nomination、Run 级执行截止时间和重启恢复。

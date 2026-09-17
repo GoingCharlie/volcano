@@ -70,7 +70,7 @@ reason reported for the first failing candidate filter or plan constraint). The
 AND-, union-, weighted-sum- and intersection-consuming dimensions are unaffected.
 `workloadscope`, `pdbconstraint`,
 `repackbudget`, `nodeconsolidation`, `networktopologyaware`,
-`workloaddisruption`, `gangdisruption`, `victimorder`, and `binpack` are
+`workloaddisruption`, `gangdisruption`, and `binpack` are
 optional; omitting one
 only disables its policy. `pdbconstraint` excludes accelerator Pods protected by
 a fresh, deterministic zero-disruption PDB during planning; temporary allowance
@@ -79,32 +79,33 @@ exhaustion is still handled by the Eviction API and the existing retry loop.
 RepackRun sets `networkTopology`; dropping it from the list silently disables
 the HyperNode-tier block constraints of such runs. The `repack` Action requires
 at least one plugin that provides the `domain` capability
-(`nodeconsolidation` today). Empty
+(`nodeconsolidation` today). That plugin also owns the count key described below,
+so dropping it switches off both. Empty
 accelerator nodes and fully occupied accelerator nodes are always excluded from
 both sides of node-level relocation before scoring; this correctness boundary
 does not depend on `binpack`.
 
-`victimorder` owns the order in which a drained node's victims are simulated. It
-places the Pod admitting the fewest other nodes first: a Pod pinned by
-`nodeSelector` or required `nodeAffinity` (including `NotIn`/`DoesNotExist`
-terms) — or blocked by node taints or cordon — is simulated while receiver
-capacity is still intact, and never silently starves its own unit. Ties on that
-count fall back to the larger target-resource request, the item-ordering half of
-first-fit decreasing. Its four boolean arguments each default to `true`:
-`nodeAffinity`, `taints`, and `cordon` select which static node-side factors are
-counted, and `resourceRequests` enables the size tie-break. Setting all three node
-factors to `false` drops the count key; setting `resourceRequests` to `false` makes
-equal counts abstain, leaving them to the framework's task-UID tie-break. Only
-static Pod-to-node constraints are considered — inter-Pod affinity, topology
-spread, and hostPorts are not, so the count is a lower bound on the true one.
-Under-counting a Pod's candidate set only simulates it earlier than strictly
-necessary; over-counting could mark a feasible unit permanently infeasible.
+`nodeconsolidation` and `binpack` each own one victim-order key, so the plugin
+list order decides which of the two leads. `nodeconsolidation` places the Pod
+with the fewest schedulable nodes first: a Pod pinned by `nodeSelector` or
+required `nodeAffinity` (including `NotIn`/`DoesNotExist` terms) — or blocked by
+node taints or cordon — is simulated while receiver capacity is still intact,
+before a looser victim can take the nodes it needs. Its three boolean arguments
+each default to `true` and select which static node-side factors are counted;
+setting all three to `false` drops the key, leaving those victims to the next
+plugin. Only static Pod-to-node constraints are considered — inter-Pod affinity,
+topology spread, hostPorts, and leftover receiver capacity are not. Those
+conditions are necessary rather than sufficient, so the count is an upper bound on
+the true one: a Pod that merely looks unconstrained is simulated later than it
+deserves. That costs ordering quality, not correctness — the simulation still
+decides feasibility.
 
-`victimorder` is the only plugin that orders victims, so no ordering between
-plugins is involved. Removing it does not make the order arbitrary — the
-framework closes every victim sort with a deterministic tie-break on task UID —
-but it does drop first-fit decreasing along with the receiver-count key, since
-both belong to this plugin.
+`binpack` owns the other key, first-fit decreasing: equal counts fall back to the
+larger target-resource request so an infeasible layout fails fast. Because the
+default list puts `nodeconsolidation` before `binpack`, the count key leads and
+the size key settles its ties; listing `binpack` first inverts that. Removing both does not
+make the order arbitrary — the framework closes every victim sort with a
+deterministic tie-break on task UID.
 
 ## Notes
 
