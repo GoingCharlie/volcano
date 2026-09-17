@@ -56,6 +56,7 @@
 - **候选单元恒为单节点**：复用 `nodeconsolidation` 的单节点单元（`Nodes` 恰好一个、`Weight: 1`），不处理单元一次腾空多个节点的情形。这样，「块语义以约束而非单元表达」成立（每步只动一个节点、逐步凑块，并天然规避「一个单元跨多个 HyperNode、与『块不能跨 H』冲突」的矛盾）。
 - **锚点即本次释放的单节点**：打分中 `FreedNodes()` 的候选部分即该单节点，`freeInH` 的「含本次候选」按 +1 计。
 - **节点未归属目标层级任何 H 时，打分取该打分项下最不受偏好的值**：块推进记 0；块分布记**该模式真实候选最小原始分之下的哨兵值**——binpack 记 `−1`、spread 记 `−(blocksInH_max+1)`——不参与区分；准入中该类腾空亦不计块。
+- **H 已到结构上限、且停在块中途时按同一原则处理**：`r = freeInH mod nodeBlockSize`，`r ≠ 0` 且 `freeableInH < nodeBlockSize − r`（等价于 `freeInH + freeableInH < nodeBlockSize × (blocksInH + 1)`，即该 H 的块数已到 `floor((freeInH + freeableInH) / nodeBlockSize)`、本次与后续腾空都不再增加块数）时，块分布记与上一条**相同的哨兵值**——两者对块数记账（R9）的贡献同为 0，不再有区别。块推进项本就把它记 0，块分布项必须同样判掉，否则调低 `nodeBlockProgressWeight` 后会把腾空引向死胡同 H（见 §4.1.3.2）。`r = 0` 不属此列：本次候选恰好把 H 凑成整块（`blocksInH ≥ 1`），是目标达成点（§4.1.3.1），块分布照常取块数原始分。
 - **node → H 为函数**：节点在目标层级至多属于一个 HyperNode，否则锚点不唯一、`freeInH` 归属歧义——若未来出现 H 重叠，须先定归属再打分。
 - **未来多节点单元的适配**：若某 Domain 贡献多节点单元，需同步调整 §4.1.3.1 步骤 1 的锚点与 `freeInH` 计数，且需保证单元不跨 H。
 
@@ -278,14 +279,14 @@ flowchart TD
 1. 从候选方案的 moves 找出本次释放的节点（同块推进打分），经 node → HyperNode 缓存定位其所属的**目标层级 HyperNode H**；
 2. 计算 H 内可用于组块的**空闲节点总数** `freeInH = idleInH + freedInH`（含本次候选）；
 3. 计算 H 内**完整块数** `blocksInH = floor(freeInH / nodeBlockSize)`；
-4. 按 `mode` 取原始得分（原始值越大越优先）。节点不属于目标层级任何 H 时，原始分取**该模式下真实候选最小原始分之下的哨兵值**，保证无 H 候选**严格差于**任何真实 H 候选（含零块 H，R6）：`binpack` 记 `−1`（真实区间 `[0, +blocksInH_max]` 的下界之下，恒为定值）；`spread` 记 `−(blocksInH_max+1)`（`blocksInH_max` 为会话内目标层级任一 H 的最大完整块数，`OnSessionOpen` 预计算，哨兵值在真实区间 `[−blocksInH_max, 0]` 的下界之下）。spread 下绝不能记 0：其取负后 0 是批内最高分，会把无 H 候选误当最优；当 `blocksInH_max = 0`（稀疏 tier）时记 `−blocksInH_max = 0` 同样退化——哨兵值把无 H 钉在真实区间之下，两种情形都不复存在。两模式哨兵值仅比真实区间下界低 1，归一化 span 各加 1，不撑爆批次；无 H 源的腾空节点对任何 H 的块数记账（R9）贡献恒为 0，而零块 H 源的腾空节点仍计入 `freedInH` 可推动凑块，故零块 H 严格优于无 H 与 R9 口径一致：
+4. 按 `mode` 取原始得分（原始值越大越优先）。节点不属于目标层级任何 H 时，原始分取**该模式下真实候选最小原始分之下的哨兵值**，保证无 H 候选**严格差于**任何可达的真实 H 候选（含可达的零块 H，R6）：`binpack` 记 `−1`（真实区间 `[0, +blocksInH_max]` 的下界之下，恒为定值）；`spread` 记 `−(blocksInH_max+1)`（`blocksInH_max` 为会话内目标层级任一 H 的最大完整块数，`OnSessionOpen` 预计算，哨兵值在真实区间 `[−blocksInH_max, 0]` 的下界之下）。spread 下绝不能记 0：其取负后 0 是批内最高分，会把无 H 候选误当最优；当 `blocksInH_max = 0`（稀疏 tier）时记 `−blocksInH_max = 0` 同样退化——哨兵值把无 H 钉在真实区间之下，两种情形都不复存在。两模式哨兵值仅比真实区间下界低 1，归一化 span 各加 1，不撑爆批次；无 H 源的腾空节点对任何 H 的块数记账（R9）贡献恒为 0，而**仍可凑块**的零块 H 源的腾空节点仍计入 `freedInH` 可推动凑块，故可达的零块 H 严格优于无 H，与 R9 口径一致。**例外是已到结构上限、且停在块中途的 H**：`r = freeInH mod nodeBlockSize`，`r ≠ 0` 且 `freeableInH < nodeBlockSize − r`（等价于 `freeInH + freeableInH < nodeBlockSize × (blocksInH+1)`，即该 H 的块数已到 `floor((freeInH + freeableInH) / nodeBlockSize)`、本次与后续腾空都不再增加块数）时，其 `freedInH` 对块数记账（R9）的贡献与无 H 源同为 0，故取**同一个哨兵值**、并列最差。本项必须与块推进项共用同一判定——实现上两块打分项共用 `blockReachable(freeInH, freeableInH, nodeBlockSize)`（真值条件 `r = 0 或 freeableInH ≥ nodeBlockSize − r`）——否则调低 `nodeBlockProgressWeight` 后，H 的块数偏好会压过块推进，把腾空引向凑不出块的死胡同 H。`r = 0` 不在例外之列：本次候选恰好把 H 凑成整块，是目标达成点。按 `mode` 取值：
    - `binpack`：返回 `+blocksInH`——候选所在 H 的完整块数**越多**越优先，新腾空的节点倾向进入已有完整块的 H，块逐步集中到少数 H；
    - `spread`：返回 `−blocksInH`——候选所在 H 的完整块数**越少**越优先，新腾空的节点倾向进入完整块少的 H，块逐步分散；
 5. 注册为 `AddPlanScoreFn("nodeBlockDistribution", weight, fn)`（权重默认 **100**，插件参数 `nodeBlockDistributionWeight` 可覆盖）。
 
 > **为什么这样打分**：块推进打分负责「把哪个 H 凑成完整块」，块分布只负责「同等进度下块落在哪」。两个候选块推进原始分相同（同一进度档）时，`binpack` 挑完整块已多的 H（富者愈富、块集中），`spread` 挑完整块尚少的 H（填平补齐、块分散）。以自己 H 的 `blocksInH` 为锚而非整批全局分布，打分函数实现简单，且与 4.1.3.1 一样锚定本次释放节点、无需跨候选汇总。
 
-**权重设置**：默认权重 **100**（插件参数 `nodeBlockDistributionWeight` 可覆盖）。块分布只表达分布偏好、用于同进度档内的二次排序，权重显著低于块推进打分的 `1000000`——后者才是达成目标的必要引导。数量级保证：块分布最大摆动 `100 × 100 = 1e4`，而块推进最小区分贡献差 `1000000 × 1 = 1e6`（归一化分整数、最少差 1 分），差 **100 倍**，故块分布**永不推翻块推进已区分的决策**，只在同一进度档内排序（再加破坏成本项联合摆动 `≤ 1e4 + 1400`，仍远小于 `1e6`）。**同进度档内**（块推进全等分、该项贡献差为 0），块分布摆动 `1e4` 仍大于成本项摆动 `1400`，故同档排序为「先分布、后成本」——这是预期行为：分布偏好与块推进同属布局目标引导，成本只是实现代价；若希望同档内成本优先，可调低 `nodeBlockDistributionWeight`（降到 `≤ 14` 时成本项反超）。未设置 `mode` 时不注册，不施加任何分布偏好。
+**权重设置**：默认权重 **100**（插件参数 `nodeBlockDistributionWeight` 可覆盖）。块分布只表达分布偏好、用于同进度档内的二次排序，权重显著低于块推进打分的 `1000000`——后者才是达成目标的必要引导。数量级保证：块分布最大摆动 `100 × 100 = 1e4`，而块推进最小区分贡献差 `1000000 × 1 = 1e6`（归一化分整数、最少差 1 分），差 **100 倍**，故块分布**永不推翻块推进已区分的决策**，只在同一进度档内排序（再加破坏成本项联合摆动 `≤ 1e4 + 1400`，仍远小于 `1e6`）。**另有一条与权重无关的保证**：已到结构上限、且停在块中途的 H 按步骤 4 取哨兵值，而任何可达 H 的原始分都在真实区间内（≥ 真实区间下界 > 哨兵值）；归一化是批次内单调变换（min→0、max→100，`clamp` 恒不生效），故哨兵值候选恒得 0 分、可达 H 候选恒得正分——只要本项权重非 0（默认 **100**），可达 H 的候选就恒优于死胡同 H。块推进项对死胡同 H 记 0、对可达 H 记 `r ≥ 1`，独立地给出同一排序：两项互不依赖，把 `nodeBlockProgressWeight`（插件参数经 `repack-engine.conf` 可配）调低至 `0` 也不会反选死胡同 H，只是把它相对成本项的区分度一并压低。**同进度档内**（块推进全等分、该项贡献差为 0），块分布摆动 `1e4` 仍大于成本项摆动 `1400`，故同档排序为「先分布、后成本」——这是预期行为：分布偏好与块推进同属布局目标引导，成本只是实现代价；若希望同档内成本优先，可调低 `nodeBlockDistributionWeight`（降到 `≤ 14` 时成本项反超）。未设置 `mode` 时不注册，不施加任何分布偏好。
 
 打分流程：
 
@@ -294,13 +295,15 @@ flowchart TD
     Cand["候选 plan：单节点排空单元"] --> FreedNode["从候选增量 moves 取 From 节点（去重 = 本次释放的节点）"]
     FreedNode --> HN["node → HyperNode 缓存，定位目标层级 HyperNode H"]
     HN --> HasH{"节点属于目标层级 H？"}
-    HasH -- 否 --> NoHScore["无 H：binpack 记 −1 / spread 记 −(blocksInH_max+1)（真实最小原始分 − 1，严格最差）"]
+    HasH -- 否 --> NoHScore["不参与区分：binpack −1 / spread −(blocksInH_max+1)（真实最小原始分 − 1，严格差于任何可达 H）"]
     HasH -- 是 --> Idle["idleInH = H 原本已空闲节点数（会话开始时预计算）"]
     HasH -- 是 --> Freed["freedInH = FreedNodes 中属于 H 的腾空节点数（含本次候选）"]
     Idle --> Sum["freeInH = idleInH + freedInH"]
     Freed --> Sum
     Sum --> Blocks["blocksInH = floor(freeInH / nodeBlockSize)：H 内完整块数"]
-    Blocks --> Mode{"mode 偏好？"}
+    Blocks --> BlockCeiling{"死胡同 H？<br/>freeInH mod nodeBlockSize ≠ 0 且<br/>freeInH + freeableInH < nodeBlockSize × (blocksInH+1)"}
+    BlockCeiling -- 是：已到结构上限且停在块中途 --> NoHScore
+    BlockCeiling -- 否 --> Mode{"mode 偏好？"}
     Mode -- binpack：块集中 --> Bin["raw = +blocksInH（块越多越优先）"]
     Mode -- spread：块分散 --> Spr["raw = −blocksInH（块越少越优先）"]
     Bin --> Order["候选批次内正向归一化到 0..100，×权重 100 与其他打分项求和 → 候选排序"]
@@ -421,7 +424,7 @@ ssn.AddReceiverPreferenceFn("nodeBlockPreserve", framework.ReceiverPreferencePha
   - **节点用量口径（复用 `api.ClassifyTargetResourceNode`，不新造计量）**：该函数（`pkg/repackengine/api/resource_node.go:56`）按 `Allocatable`/`Used` 把节点分四类——`Unavailable`（不提供目标资源，`capacity <= 0`）、`Empty`（提供、用量为 0）、`Partial`（`0 < used < capacity`）、`Full`（`used >= capacity`）。会话级预计算据此口径：
     - `idleInH[hn]` = H 内 `== TargetResourceNodeEmpty` 的节点数。**仅 `Empty`，排除 `Unavailable`**——后者容量为 0、无法承载该资源的新 pod，计入会把块数/进度虚高；块语义里「空闲节点」指「可被新任务落位的目标资源节点」。
     - `busyInH[hn]` = H 内 `== TargetResourceNodePartial` 的节点数。**仅 `Partial`**：`Full` 无迁移收益、`Unavailable` 无目标资源可腾，均不计；与 `nodeconsolidation` 只对 `Partial` 产腾空单元（`node_consolidation.go:54`）的「可腾空节点」认定同源。
-    - `freeableInH = busyInH − freedInH`：`busyInH` 既仅含 `Partial` 可腾空节点，step4「还能凑出完整块」的乐观上界口径正确（把可腾空节点都算作可凑块资源，不做逐节点迁移可行性检查，只影响相对排序，真凑不成由块数准入兜底拒）。
+    - `freeableInH = busyInH − freedInH`：`busyInH` 既仅含 `Partial` 可腾空节点，step4「可腾空节点是否补得满这一块」的乐观上界口径正确（把可腾空节点都算作可凑块资源，不做逐节点迁移可行性检查，只影响相对排序，真凑不成由块数准入兜底拒）。
     - `blocksInH_max = max_{hn} floor((idleInH[hn] + busyInH[hn]) / nodeBlockSize)`，供块分布打分给无 H 候选取真实区间下界之下的哨兵值：`spread` 记 `−(blocksInH_max+1)`、`binpack` 恒记 `−1`（与其无关）。
   - 复用同源口径的收益：与 `nodeconsolidation`（腾空候选）共用节点分类，不新造一套「何为空闲/可腾空」计量；`Unavailable` 与 `Full` 在腾空/空闲两侧都被明确排除，边界可由单测直接断言（见 R 约束对应项）；
 - 默认插件列表 `pkg/repackengine/conf/config.go` 的 `DefaultPluginOptions()` 加入 `networktopologyaware`；
@@ -615,8 +618,8 @@ flowchart TD
   - 验证：单测覆盖「候选节点属于目标层级 H / 不属于任何 H」两类；代码审查确认注释存在。
 - **R5 node → H 映射为函数**：每个节点在目标层级至多属于一个 H，`freeInH` 归属无歧义；重叠归属按既定规则先定归属再打分。
   - 验证：单测构造重叠归属输入，断言不出现节点被双计。
-- **R6 无 H 节点取最不受偏好值**：块推进 score = 0；块分布记**该模式真实候选最小原始分之下的哨兵值**——binpack 记 `−1`、spread 记 `−(blocksInH_max+1)`，保证无 H 候选**严格差于**任何真实候选（含零块 H）。
-  - 验证：单测——无 H 候选与真实候选同批比较，断言其归一化得分**必为批内最低**（`binpack` 下 `−1` < 零块 H 的 `0`；`spread` 下 `−(blocksInH_max+1)` < 任何真实候选的 `−blocksInH`，含 `blocksInH_max = 0` 时 `−1` < `0`）；e2e E6 在真实集群复验。
+- **R6 无 H 节点与死胡同 H 取最不受偏好值**：块推进 score = 0；块分布记**该模式真实候选最小原始分之下的哨兵值**——binpack 记 `−1`、spread 记 `−(blocksInH_max+1)`，保证无 H 候选**严格差于**任何可达的真实候选（含可达的零块 H）。**已到结构上限、且停在块中途的 H**（`r = freeInH mod nodeBlockSize`，`r ≠ 0` 且 `freeableInH < nodeBlockSize − r`，§4.1.3.2 步骤 4）取**同一哨兵值**，与无 H 并列最差；`r = 0` 的 H 不取哨兵值——本次候选恰好把它凑成整块，是目标达成点。
+  - 验证：单测——无 H 候选与真实候选同批比较，断言其归一化得分**必为批内最低**（`binpack` 下 `−1` < 零块 H 的 `0`；`spread` 下 `−(blocksInH_max+1)` < 任何真实候选的 `−blocksInH`，含 `blocksInH_max = 0` 时 `−1` < `0`）；死胡同 H 与仍可凑块的 H 同批比较，断言前者原始分更低、候选总分更低——推进权重取默认值与 `0`（该项被权重 `0` 禁用）两组都成立，即该排序不依赖块推进项兜底；e2e E6 在真实集群复验。
 - **R7 块推进三档公式**：`r = freeInH mod size`；`r == 0 → score = size`；`freeableInH < size − r → score = 0`；否则 `score = r`。其中 `freeInH = idleInH + freedInH`、`freeableInH = busyInH − freedInH`。
   - 验证：表驱动单测覆盖 `(freeInH, freeableInH, size)` 组合断言精确值，含 `size = 1` 退化（score 恒为 1）与「刚好凑满」（r == 0）边界。
 - **R8 块分布公式**：`blocksInH = floor(freeInH / size)`；`binpack → +blocksInH`、`spread → −blocksInH`。
@@ -759,6 +762,9 @@ flowchart TD
   - 实现（统一原则）：无 H 原始分 = 该模式真实候选**最小原始分 − 1**——binpack 记 `−1`（真实区间 `[0, +blocksInHMax]` 下界之下，恒为定值）、spread 记 `−(blocksInHMax + 1)`（真实区间 `[−blocksInHMax, 0]` 下界之下）。两模式下无 H 均严格差于一切真实候选（含零块 H）；哨兵值仅比下界低 1，归一化 span 各加 1，不撑爆批次。行为收益与 R9 记账一致：零块 H 源的腾空节点计入 `freedInH`（可推动凑块），无 H 源贡献恒 0。
   - 同步更新：`nodeBlockDistributionScore` 纯函数断言（binpack no-H `0→−1`、spread no-H `−blocksInHMax → −(blocksInHMax+1)`、空 tier `0→−1`）、R6/E6 相关测试；补「零块 H vs 无 H」集成对比——spread 已有，binpack 新增镜像用例。提交 `c31ea6874`。
   - 性质：影响偏好正确性。
+
+- **块分布项补判可达性，死胡同 H 不再靠块数领先（提交 `e94975114`）**：块分布原始分只取 `blocksInH`、不判可达性——H 已到结构上限却停在块中途时，它仍凭已攒下的块数原始分领先；一旦调低 `nodeBlockProgressWeight`（此前块推进项是唯一判可达性的打分项），腾空就会被引向凑不出块的死胡同 H。改为两块打分项共用 `blockReachable(freeInH, freeableInH, nodeBlockSize)`（`r = freeInH mod nodeBlockSize`，真值条件 `r = 0 或 freeableInH ≥ nodeBlockSize − r`）：判定为假时本项取与无 H **相同的哨兵值**；`r = 0`（本次候选恰好凑成整块）不取哨兵值。实现上原 `nodeBlockDistributionScore(mode, hasHyperNode, blocks, maxBlocksInHyperNode)` 用 `hasHyperNode` 布尔在同一函数内二选一，哨兵值一支被绑死在「无 H」上；本次按取值语义拆为 `nodeBlockDistributionScore`（块数原始分）与 `nodeBlockDistributionFloor`（哨兵值）两个纯函数，改由调用方按 `blockReachable` 选择哨兵值一支，两种情形共用。单测 `TestHyperNodeAtBlockCeilingDoesNotOutrankOneThatCanCompleteABlock`（四组：两 mode × 默认/`0` 推进权重）、`TestHyperNodesAtBlockCeilingTieOnBothBlockTerms` 钉住。
+  - 性质：影响偏好正确性（R6）。
 
 - **Execute 侧「整单元腾空」判据集合化（`gangFullyVacated`，提交 `cb018e7f2`）**：H1 锚点清空由 `gangFullyVacated` 判「本 gang 计划态是否已整单元腾空」触发（`allowedDomainsForTrial`，`domain_relocation.go:179-187`：判中则临时清空 `AllocatedHyperNode`、走无锚分支，见 §4.2.3「允许域求值细节」）。原实现以计数相等 `AllocatedTaskNum() == len(victims)` 近似集合相等，仅当 victim 含非 Allocated 状态任务时发散——恰是 Execute/reconcile 形态（victim 为单颗 **Pending replacement pod**，`AllocatedTaskNum` 只计 Allocated/Bound/Binding/Running、排除 Pending）：2-pod gang 撤离 1 颗、剩 1 residual Running 时 `1==1` 恒真 → 误判整单元腾空 → 清锚 → partial-evac 逃出源子树（违背 R20 的 partial-evac keep-in-source-subtree 锚定语义）。改为**集合成员相等**：由 `unit.victims` 建 victimID 集（跳过 nil），枚举 `job.TaskStatusIndex`（SubJob 单元取 `subJob.TaskStatusIndex`）中全部 `AllocatedStatus` 任务，任一不在 victim 集即非整单元腾空。Planning 侧 victim 全为 Running、计数与集合等价、行为不变。单测 `TestGangFullyVacated_SetMembership`（5 用例：Execute partial-evac 残留保锚 / Execute 全撤离清锚 / planning 整 gang 撤离 / planning partial-evac 保锚 / subjob partial-evac 残留保锚）钉住。
   - 性质：影响正确性（锚点清空判据）。**后续注记**：§4.2.4 移除 Execute 侧对 `FeasibleRelocation` 的调用后，此条所修的「Execute/reconcile 形态」（victim = Pending replacement pod）已不可达——`allowedDomainsForTrial` 现仅由规划期调用、victim 恒为 Running。集合成员相等的实现仍正确（对规划形态与计数等价），保留为防御性写法、不再改动。
