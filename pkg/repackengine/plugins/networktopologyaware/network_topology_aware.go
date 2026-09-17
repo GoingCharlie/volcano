@@ -15,22 +15,16 @@ limitations under the License.
 */
 
 // Package networktopologyaware turns RepackRun.spec.networkTopology into
-// HyperNode-block shaping. When a run names a target HyperNode tier and block
-// size, it registers two plan-score terms (node-block progress, node-block
+// HyperNode-block shaping: two plan-score terms (node-block progress, node-block
 // distribution), one hard block-count constraint, and one receiver preference
-// (nodeBlockPreserve) that steers relocated pods away from the target tier's
+// (nodeBlockPreserve) steering relocated pods away from the target tier's
 // HyperNodes (no-H > other HyperNode > own HyperNode).
 //
-// It contributes no freeable unit of its own: it reuses nodeconsolidation's
-// single-node unit (every candidate frees exactly one node), expressing block
-// semantics as constraints. When networkTopology is unset the plugin registers
-// nothing, so the engine runs unchanged.
-//
-// Single-node-unit assumption: all scoring anchors read IncrementalFromNodes()[0],
-// relying on the candidate freeing exactly one node so the anchor is unique, and
-// freeInHyperNode counts this candidate as +1. If a future domain contributes
-// multi-node units these anchors and the accounting must be revisited, and units
-// must never span multiple HyperNodes.
+// It contributes no freeable unit of its own — it reuses nodeconsolidation's
+// single-node unit — so all scoring anchors read IncrementalFromNodes()[0] and
+// count this candidate as +1. Multi-node units would invalidate that accounting;
+// units must never span HyperNodes. With networkTopology unset it registers
+// nothing and the engine runs unchanged.
 //
 // Activation — free two blocks of 4 nodes in the tier named "accel", spreading
 // them across HyperNodes:
@@ -47,9 +41,8 @@ limitations under the License.
 //	  goals:
 //	    - resource: nvidia.com/gpu
 //
-// The plugin is enabled by default in repack-engine.conf's plugins list. Its
-// two block-term weights (defaults below) are tunable through the plugin
-// arguments there; a zero weight disables the corresponding term:
+// Enabled by default in repack-engine.conf; its two weights are tunable there
+// (zero disables the term):
 //
 //	plugins:
 //	- name: networktopologyaware
@@ -75,9 +68,7 @@ import (
 // Name is the config name for this plugin.
 const Name = "networktopologyaware"
 
-// Default weights for the two block score terms. Progress outweighs distribution
-// so a progress difference dominates candidate ordering; distribution only
-// breaks equal-progress ties.
+// Default weights: progress dominates ordering, distribution breaks equal-progress ties.
 const (
 	weightNodeBlockProgress     int64 = 1000000
 	weightNodeBlockDistribution int64 = 100
@@ -115,8 +106,7 @@ func configuredWeight(arguments framework.Arguments, key string, defaultValue in
 	return value
 }
 
-// validateArguments mirrors workloaddisruption: unknown keys are rejected and
-// both weights must be non-negative. A zero weight disables the term.
+// validateArguments rejects unknown keys; both weights must be non-negative.
 func validateArguments(arguments framework.Arguments) error {
 	if err := arguments.ValidateKeys(argNodeBlockProgressWeight, argNodeBlockDistributionWeight); err != nil {
 		return err
@@ -140,25 +130,22 @@ func (*networkTopologyAwarePlugin) Name() string { return Name }
 // nodeBlockSession holds the per-session topology precompute shared by the
 // callbacks. It is built once in OnSessionOpen and must not change during the pass.
 type nodeBlockSession struct {
-	// targetTier is the HyperNode tier the run plans against.
 	targetTier int
-	// size is the number of nodes in one block (nodeBlockSize, >= 1).
+	// size is nodeBlockSize, clamped to >= 1.
 	size int
 	// requiredBlocks is the hard admission floor (requiredNodeBlocks).
 	requiredBlocks int
 	// mode is the block distribution preference ("" when unset).
-	mode repackv1alpha1.RepackBlockMode
-	// hyperNodesInTier is the ordered list of HyperNode names at targetTier.
+	mode             repackv1alpha1.RepackBlockMode
 	hyperNodesInTier []string
-	// nodeToHyperNode maps each real node at targetTier to its HyperNode (a node
-	// is in at most one); nodes outside the tier are absent.
+	// nodeToHyperNode maps each real node at targetTier to its HyperNode (at most
+	// one); nodes outside the tier are absent.
 	nodeToHyperNode map[string]string
-	// idleInHyperNode / busyInHyperNode are the session-start counts per HyperNode of
-	// Empty (zero target-resource usage) and Partial nodes; Unavailable/Full are
-	// excluded on purpose (see the ClassifyTargetResourceNode reuse below).
+	// idleInHyperNode / busyInHyperNode count Empty (zero target-resource usage) and
+	// Partial nodes per HyperNode; Unavailable/Full are excluded on purpose.
 	idleInHyperNode map[string]int
 	busyInHyperNode map[string]int
-	// maxBlocksInHyperNode is the tier max of floor((idle+busy)/size); spread mode's
+	// maxBlocksInHyperNode is the tier max of floor((idle+busy)/size): spread mode's
 	// least-preferred raw score for nodes outside any HyperNode.
 	maxBlocksInHyperNode int
 }
@@ -170,15 +157,12 @@ func (p *networkTopologyAwarePlugin) OnSessionOpen(ssn *framework.Session) {
 		runName = run.Name
 	}
 	if run == nil || run.Spec.NetworkTopology == nil {
-		// networkTopology unset: register nothing; the engine runs unchanged.
 		klog.V(4).InfoS("repack networktopologyaware: networkTopology unset, plugin inactive", "run", runName)
 		return
 	}
 	blockSession, ok := buildNodeBlockSession(ssn, run.Spec.NetworkTopology)
 	if !ok {
-		// Target tier unresolvable (no HyperNode at it): no topology to plan
-		// against, so stay inert — but warn, since the user explicitly configured
-		// networkTopology.
+		// Nothing to plan against, but warn: the user did configure networkTopology.
 		topology := run.Spec.NetworkTopology
 		klog.Warningf("repack networktopologyaware: target tier unresolvable (tier=%s tierName=%s), block shaping inactive; run=%s",
 			tierString(topology), tierNameString(topology), runName)
@@ -188,12 +172,12 @@ func (p *networkTopologyAwarePlugin) OnSessionOpen(ssn *framework.Session) {
 		"run", runName, "tier", blockSession.targetTier, "blockSize", blockSession.size,
 		"requiredBlocks", blockSession.requiredBlocks, "mode", blockSession.mode,
 		"hyperNodeCount", len(blockSession.hyperNodesInTier))
-	p.registerNodeBlockProgressScore(ssn, blockSession) // always registered
+	p.registerNodeBlockProgressScore(ssn, blockSession)
 	if blockSession.mode == repackv1alpha1.RepackBlockModeBinpack || blockSession.mode == repackv1alpha1.RepackBlockModeSpread {
 		p.registerNodeBlockDistributionScore(ssn, blockSession) // binpack/spread only
 	}
-	p.registerBlockCountConstraint(ssn, blockSession)        // always registered
-	p.registerNodeBlockReceiverPreference(ssn, blockSession) // always registered
+	p.registerBlockCountConstraint(ssn, blockSession)
+	p.registerNodeBlockReceiverPreference(ssn, blockSession)
 }
 
 // tierString / tierNameString render the pointer tier identifiers for logs
@@ -213,16 +197,15 @@ func tierNameString(topology *repackv1alpha1.NetworkTopology) string {
 }
 
 // buildNodeBlockSession resolves the target tier, the node->HyperNode index and
-// the session-start idle/busy counts. ok=false when the tier does not exist or
-// holds no HyperNode.
+// the session-start idle/busy counts. ok=false when the tier holds no HyperNode.
 func buildNodeBlockSession(ssn *framework.Session, topology *repackv1alpha1.NetworkTopology) (*nodeBlockSession, bool) {
 	snapshot := ssn.Snapshot()
 	targetTier, ok := resolveTargetTier(snapshot, topology)
 	if !ok {
 		return nil, false
 	}
-	// nodeBlockSize is a pointer; the apiserver defaults it to 1 and enforces
-	// minimum 1. Defend direct-informer/test inputs: nil or <1 -> 1.
+	// The apiserver defaults nodeBlockSize to 1 and never below; defend nil/<1
+	// anyway, since direct informer and test inputs bypass it.
 	size := 1
 	if topology.NodeBlockSize != nil {
 		size = *topology.NodeBlockSize
@@ -250,8 +233,7 @@ func buildNodeBlockSession(ssn *framework.Session, topology *repackv1alpha1.Netw
 		return nil, false
 	}
 
-	// node -> HyperNode at the target tier. A node is normally in at most one
-	// HyperNode per tier; on overlap keep the first hit, warn, and never double count.
+	// On overlap keep the first hit, warn, and never count a node twice.
 	for _, hyperNode := range blockSession.hyperNodesInTier {
 		for node := range realNodesSet[hyperNode] {
 			if existing, taken := blockSession.nodeToHyperNode[node]; taken && existing != hyperNode {
@@ -262,13 +244,10 @@ func buildNodeBlockSession(ssn *framework.Session, topology *repackv1alpha1.Netw
 		}
 	}
 
-	// Session-start idle/busy counts via ClassifyTargetResourceNode, so the
-	// "empty vs freeable" split matches nodeconsolidation (one source of truth).
-	// Unavailable (capacity 0) and Full nodes are excluded: they can neither host
-	// target-resource pods nor be freed for block semantics.
+	// ClassifyTargetResourceNode keeps the empty/freeable split identical to
+	// nodeconsolidation; Unavailable and Full nodes count for neither.
 	resource := ssn.Resource()
-	// Index snapshot nodes by name once so classification below is O(T), not
-	// O(T x C) (a full-cluster scan per tier node).
+	// Index by name once so classification is O(T), not O(T x C).
 	nodeByName := make(map[string]*schedapi.NodeInfo, len(snapshot.Nodes()))
 	for _, n := range snapshot.Nodes() {
 		if n != nil && n.Name != "" {
@@ -313,8 +292,7 @@ func resolveTargetTier(snapshot framework.Snapshot, topology *repackv1alpha1.Net
 	return 0, false
 }
 
-// freedInHyperNode counts how many of the plan's freed nodes belong to hyperNode at
-// the target tier. Nodes outside every HyperNode count 0.
+// freedInHyperNode counts the plan's freed nodes inside hyperNode; nodes elsewhere count 0.
 func freedInHyperNode(freedNodes []string, hyperNode string, nodeToHyperNode map[string]string) int {
 	count := 0
 	for _, node := range freedNodes {
@@ -325,10 +303,19 @@ func freedInHyperNode(freedNodes []string, hyperNode string, nodeToHyperNode map
 	return count
 }
 
-// nodeBlockProgressScore implements the block-progress formula over the anchor
-// HyperNode once this candidate's plan-freed nodes are counted:
-// freeInHyperNode = session idle + plan-freed (its free node count),
-// freeableInHyperNode = session busy - plan-freed (still drainable). size >= 1.
+// blockReachable is the one reachability test shared by both block terms: can the
+// anchor HyperNode reach a complete block once this plan's frees land?
+func blockReachable(freeInHyperNode, freeableInHyperNode, size int) bool {
+	if size < 1 {
+		size = 1
+	}
+	r := freeInHyperNode % size
+	return r == 0 || freeableInHyperNode >= size-r
+}
+
+// nodeBlockProgressScore scores the anchor HyperNode's block progress once this
+// candidate's frees land: freeInHyperNode = idle + plan-freed, freeableInHyperNode
+// = busy - plan-freed.
 func nodeBlockProgressScore(freeInHyperNode, freeableInHyperNode, size int) int64 {
 	if size < 1 {
 		size = 1
@@ -337,42 +324,39 @@ func nodeBlockProgressScore(freeInHyperNode, freeableInHyperNode, size int) int6
 	switch {
 	case r == 0:
 		return int64(size) // candidate completes a block
-	case freeableInHyperNode < size-r:
+	case !blockReachable(freeInHyperNode, freeableInHyperNode, size):
 		return 0 // a complete block is unreachable
 	default:
-		return int64(r) // block still reachable: closer to full wins
+		return int64(r) // block reachable: closer to full wins
 	}
 }
 
-// nodeBlockDistributionScore is the raw score of the node-block distribution
-// term. For an anchor outside every HyperNode (hasHyperNode=false) it returns a
-// sentinel one below the mode's real minimum — -1 for binpack and
-// -(maxBlocksInHyperNode+1) for spread — so a no-H candidate always loses and,
-// for spread, never ties a zero-block HyperNode when the tier is sparse (every
-// HyperNode smaller than the block size), where zero blocks is the best score.
-// Otherwise blocks is the anchor HyperNode's complete-block count and the score
-// is +blocks (binpack: concentrate) or -blocks (spread: disperse).
-func nodeBlockDistributionScore(mode repackv1alpha1.RepackBlockMode, hasHyperNode bool, blocks, maxBlocksInHyperNode int) int64 {
-	if !hasHyperNode {
-		switch mode {
-		case repackv1alpha1.RepackBlockModeBinpack:
-			return -1 // one below the real minimum raw 0 (zero-block H)
-		case repackv1alpha1.RepackBlockModeSpread:
-			return -int64(maxBlocksInHyperNode) - 1 // one below the real minimum raw -maxBlocksInHyperNode
-		}
-		return 0
-	}
+// nodeBlockDistributionScore: binpack prefers more blocks (concentrate), spread fewer.
+func nodeBlockDistributionScore(mode repackv1alpha1.RepackBlockMode, blocks int) int64 {
 	switch mode {
 	case repackv1alpha1.RepackBlockModeBinpack:
-		return int64(blocks) // more blocks is better (concentrate)
+		return int64(blocks)
 	case repackv1alpha1.RepackBlockModeSpread:
-		return -int64(blocks) // fewer blocks is better (disperse)
+		return -int64(blocks)
 	}
 	return 0
 }
 
-// totalBlocksInTier sums floor((idleInHyperNode[h] + freedByHyperNode[h]) / size) over the
-// target tier's HyperNodes; nodes outside the tier contribute 0.
+// nodeBlockDistributionFloor is the raw score for an anchor that is no block
+// candidate: outside every HyperNode, or inside one already at its block ceiling,
+// where draining every remaining node cannot fill a block. Neither says where a
+// block should go, so both take one below the mode's real minimum.
+func nodeBlockDistributionFloor(mode repackv1alpha1.RepackBlockMode, maxBlocksInHyperNode int) int64 {
+	switch mode {
+	case repackv1alpha1.RepackBlockModeBinpack:
+		return -1 // one below the real minimum raw 0 (zero-block H)
+	case repackv1alpha1.RepackBlockModeSpread:
+		return -int64(maxBlocksInHyperNode) - 1 // one below the real minimum raw -maxBlocksInHyperNode
+	}
+	return 0
+}
+
+// totalBlocksInTier sums floor((idle + freed) / size) over the tier's HyperNodes.
 func totalBlocksInTier(idleInHyperNode, freedByHyperNode map[string]int, hyperNodesInTier []string, size int) int {
 	if size < 1 {
 		size = 1
@@ -384,29 +368,25 @@ func totalBlocksInTier(idleInHyperNode, freedByHyperNode map[string]int, hyperNo
 	return total
 }
 
-// ---- node-block progress score ----
-
 func (p *networkTopologyAwarePlugin) registerNodeBlockProgressScore(ssn *framework.Session, blockSession *nodeBlockSession) {
 	ssn.AddPlanScoreFn("nodeBlockProgress", p.progressWeight, func(_ *api.PlanContext, plan *api.CandidatePlan) int64 {
 		anchor := plan.IncrementalFromNodes()
 		if len(anchor) == 0 {
 			return 0
 		}
-		// Single-node unit: the anchor is the unique node freed by this candidate.
+		// Single-node unit: the anchor is the unique node this candidate frees.
 		hyperNode, ok := blockSession.nodeToHyperNode[anchor[0]]
 		if !ok {
-			return 0 // node belongs to no HyperNode at the target tier: least preferred
+			return 0 // no HyperNode: least preferred
 		}
 		freedCount := freedInHyperNode(plan.FreedNodes(), hyperNode, blockSession.nodeToHyperNode)
 		return nodeBlockProgressScore(
-			blockSession.idleInHyperNode[hyperNode]+freedCount, // freeInHyperNode: idle + plan-freed (incl. this candidate)
-			blockSession.busyInHyperNode[hyperNode]-freedCount, // freeableInHyperNode: still drainable
+			blockSession.idleInHyperNode[hyperNode]+freedCount, // idle + plan-freed, counting this candidate
+			blockSession.busyInHyperNode[hyperNode]-freedCount, // busy - plan-freed: what is left to drain
 			blockSession.size,
 		)
 	})
 }
-
-// ---- node-block distribution score ----
 
 func (p *networkTopologyAwarePlugin) registerNodeBlockDistributionScore(ssn *framework.Session, blockSession *nodeBlockSession) {
 	ssn.AddPlanScoreFn("nodeBlockDistribution", p.distributionWeight, func(_ *api.PlanContext, plan *api.CandidatePlan) int64 {
@@ -416,16 +396,18 @@ func (p *networkTopologyAwarePlugin) registerNodeBlockDistributionScore(ssn *fra
 		}
 		hyperNode, ok := blockSession.nodeToHyperNode[anchor[0]]
 		if !ok {
-			// No H: least-preferred value for the mode.
-			return nodeBlockDistributionScore(blockSession.mode, false, 0, blockSession.maxBlocksInHyperNode)
+			// No H: no block to account for.
+			return nodeBlockDistributionFloor(blockSession.mode, blockSession.maxBlocksInHyperNode)
 		}
 		freedCount := freedInHyperNode(plan.FreedNodes(), hyperNode, blockSession.nodeToHyperNode)
-		blocks := (blockSession.idleInHyperNode[hyperNode] + freedCount) / blockSession.size
-		return nodeBlockDistributionScore(blockSession.mode, true, blocks, blockSession.maxBlocksInHyperNode)
+		freeInHyperNode := blockSession.idleInHyperNode[hyperNode] + freedCount
+		if !blockReachable(freeInHyperNode, blockSession.busyInHyperNode[hyperNode]-freedCount, blockSession.size) {
+			// At its block ceiling: same floor as a no-H anchor.
+			return nodeBlockDistributionFloor(blockSession.mode, blockSession.maxBlocksInHyperNode)
+		}
+		return nodeBlockDistributionScore(blockSession.mode, freeInHyperNode/blockSession.size)
 	})
 }
-
-// ---- block-count admission (hard gate) ----
 
 func (p *networkTopologyAwarePlugin) registerBlockCountConstraint(ssn *framework.Session, blockSession *nodeBlockSession) {
 	runName := ""
@@ -433,8 +415,7 @@ func (p *networkTopologyAwarePlugin) registerBlockCountConstraint(ssn *framework
 		runName = run.Name
 	}
 	ssn.AddConstraintFn(func(_ *api.PlanContext, plan *api.RepackPlan) (bool, string) {
-		// requiredBlocks==0 (default): always admit — pure soft guidance, and skips
-		// the nil-plan guard (PlanAdmissible only evaluates non-nil plans today).
+		// requiredBlocks==0 (default): pure soft guidance, always admit.
 		if blockSession.requiredBlocks == 0 {
 			return true, ""
 		}
@@ -461,29 +442,23 @@ func (p *networkTopologyAwarePlugin) registerBlockCountConstraint(ssn *framework
 	})
 }
 
-// ---- node-block receiver preference (receiver steering) ----
-
 // registerNodeBlockReceiverPreference steers relocated pods away from the target
-// tier's HyperNodes, closing the receiver side of block shaping. Per receiver it
-// prefers no-HyperNode ({3}) > another HyperNode ({2}) > own HyperNode ({1}), and
-// abstains ({}) when the candidate frees no node.
+// tier's HyperNodes: no-HyperNode ({3}) > another HyperNode ({2}) > own HyperNode
+// ({1}), abstaining ({}) when the candidate frees no node.
 //
-// It only reorders the receiver list — firstFeasibleReceiver still takes the first
-// feasible receiver — so it adds no infeasibility and the block-count gate (which
-// counts freed nodes, not destinations) is unaffected. Registering in the Topology
-// phase keeps the stability policies (staysOccupied: filled/immovable/scope-excluded/
-// stuck receivers) ahead of this key; filling those never hurts the block pool since
-// they could not be drained anyway. Registering unconditionally preserves block
-// progress independently of the binpack/spread mode.
+// It only reorders receivers — firstFeasibleReceiver always takes the first feasible
+// one — so it cannot make a plan infeasible, and the block-count gate (which counts
+// freed nodes, not destinations) is unaffected. Registering in the Topology phase
+// keeps the stability policies ahead of this key; filling those never hurts the
+// block pool, since they could not be drained anyway.
 func (p *networkTopologyAwarePlugin) registerNodeBlockReceiverPreference(ssn *framework.Session, blockSession *nodeBlockSession) {
 	ssn.AddReceiverPreferenceFn("nodeBlockPreserve", framework.ReceiverPreferencePhaseTopology,
 		func(_ *api.PlanContext, candidate *framework.PlanningCandidate, receiver *framework.ReceiverCandidate) framework.ReceiverPreference {
 			anchors := candidate.Plan.IncrementalFromNodes()
 			if len(anchors) == 0 {
-				return framework.ReceiverPreference{} // no anchor: abstain, let later keys decide
+				return framework.ReceiverPreference{} // no anchor: abstain
 			}
-			// Preserve every anchor HyperNode (a single-node unit collapses this to
-			// one; set form kept for generality).
+			// Set form kept for generality; a single-node unit collapses this to one.
 			ownHs := make(map[string]bool, len(anchors))
 			for _, n := range anchors {
 				if h, ok := blockSession.nodeToHyperNode[n]; ok {
@@ -495,9 +470,9 @@ func (p *networkTopologyAwarePlugin) registerNodeBlockReceiverPreference(ssn *fr
 			case !inTier:
 				return framework.ReceiverPreference{3} // export the load outside the tier
 			case ownHs[receiverHyperNode]:
-				return framework.ReceiverPreference{1} // own HyperNode: last resort
+				return framework.ReceiverPreference{1}
 			default:
-				return framework.ReceiverPreference{2} // another HyperNode
+				return framework.ReceiverPreference{2}
 			}
 		})
 }
