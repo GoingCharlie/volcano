@@ -420,7 +420,7 @@ func TestPlacementObservationDeadlinePassed(t *testing.T) {
 	}
 }
 
-func TestPlannedNodeFreeingCanConvergeUntilPlacementDeadline(t *testing.T) {
+func TestPlannedNodeReleaseCanConvergeUntilPlacementDeadline(t *testing.T) {
 	deadline := metav1.NewTime(time.Unix(100, 0))
 	run := &repackv1alpha1.RepackRun{Status: repackv1alpha1.RepackRunStatus{
 		Plan:              &repackv1alpha1.RepackPlan{FreedNodes: []string{"source"}},
@@ -431,26 +431,23 @@ func TestPlannedNodeFreeingCanConvergeUntilPlacementDeadline(t *testing.T) {
 		}},
 	}}
 
-	comparison, pending := placementexecutor.FreedNodeVerificationPending(run, time.Unix(99, 0))
-	if comparison.Equal {
-		t.Fatal("planned and actual freed-node sets must initially differ")
-	}
-	if !pending {
-		t.Fatal("a transient missing node must be retried before the deadline")
+	observation := placementexecutor.NodeReleaseObservation{Pending: []string{"source"}}
+	if !placementexecutor.NodeReleaseVerificationPending(run, observation, time.Unix(99, 0)) {
+		t.Fatal("a transient source-node observation must be retried before the deadline")
 	}
 
-	run.Status.Result.FreedNodes = []string{"source"}
-	if comparison, pending = placementexecutor.FreedNodeVerificationPending(run, time.Unix(99, 0)); !comparison.Equal || pending {
-		t.Fatalf("comparison=%+v, want converged planned and actual node sets", comparison)
+	observation = placementexecutor.NodeReleaseObservation{Released: []string{"source"}}
+	if placementexecutor.NodeReleaseVerificationPending(run, observation, time.Unix(99, 0)) {
+		t.Fatal("a released source node must not remain pending")
 	}
 
-	run.Status.Result.FreedNodes = nil
-	if comparison, pending = placementexecutor.FreedNodeVerificationPending(run, time.Unix(100, 0)); comparison.Equal || pending {
-		t.Fatal("a persistently occupied planned node must become terminal at the deadline")
+	observation = placementexecutor.NodeReleaseObservation{Pending: []string{"source"}}
+	if placementexecutor.NodeReleaseVerificationPending(run, observation, time.Unix(100, 0)) {
+		t.Fatal("an unresolved source-node observation must become terminal at the deadline")
 	}
-	decision := placementexecutor.EvaluateTerminal(run, false)
-	if decision.Succeeded || decision.Reason != state.ReasonBenefitNotRealized {
-		t.Fatalf("decision=%+v, want failed %s", decision, state.ReasonBenefitNotRealized)
+	decision := placementexecutor.EvaluateTerminal(run, false, observation)
+	if decision.Succeeded || decision.Reason != state.ReasonResultVerificationFailed {
+		t.Fatalf("decision=%+v, want failed %s", decision, state.ReasonResultVerificationFailed)
 	}
 }
 
@@ -501,14 +498,14 @@ func TestUpdateActualExecuteResult(t *testing.T) {
 	}
 }
 
-func TestUpdateActualExecuteResultDoesNotClaimOccupiedPlannedNode(t *testing.T) {
+func TestConcurrentWorkloadReuseDoesNotFailReleasedPlannedNode(t *testing.T) {
 	resource := v1.ResourceName("example.com/accelerator")
 	resourceOf := func(cards int64) *schedapi.Resource {
 		return &schedapi.Resource{ScalarResources: map[v1.ResourceName]float64{resource: float64(cards * 1000)}}
 	}
 	nodes := []*schedapi.NodeInfo{{
 		Name: "planned", Allocatable: resourceOf(8), Used: resourceOf(2),
-		Tasks: map[schedapi.TaskID]*schedapi.TaskInfo{"concurrent": {Resreq: resourceOf(2)}},
+		Tasks: map[schedapi.TaskID]*schedapi.TaskInfo{"concurrent-uid": {UID: "concurrent-uid", Resreq: resourceOf(2)}},
 	}}
 	run := &repackv1alpha1.RepackRun{Status: repackv1alpha1.RepackRunStatus{
 		Plan: &repackv1alpha1.RepackPlan{
@@ -521,20 +518,116 @@ func TestUpdateActualExecuteResultDoesNotClaimOccupiedPlannedNode(t *testing.T) 
 		},
 		Result: &repackv1alpha1.RepackResult{},
 		Relocations: []repackv1alpha1.PodRelocationStatus{{
-			Namespace: "ns", PodGroupName: "pg", VictimPodName: "victim", PlannedNodeName: "receiver", Placement: repackv1alpha1.PodPlacementStatus{Phase: repackv1alpha1.PodPlacementPlaced},
+			Namespace: "ns", PodGroupName: "pg", VictimPodName: "victim", VictimPodUID: "victim-uid", PlannedNodeName: "receiver",
+			Eviction: repackv1alpha1.PodEvictionStatus{Phase: repackv1alpha1.PodEvictionAccepted},
+			Placement: repackv1alpha1.PodPlacementStatus{
+				Phase: repackv1alpha1.PodPlacementPlaced, ReplacementPodUID: "replacement-uid",
+				SelectedNodeName: "receiver", ActualNodeName: "receiver",
+			},
 		}},
 	}}
 
 	updateActualExecuteResult(run, nodes, resource)
 	if len(run.Status.Result.FreedNodes) != 0 || run.Status.Result.FreedNodeCount != 0 {
-		t.Fatalf("result=%+v, want no freed node while planned node remains occupied", run.Status.Result)
+		t.Fatalf("result=%+v, want no currently-free node after concurrent reuse", run.Status.Result)
 	}
-	decision := placementexecutor.EvaluateTerminal(run, false)
+	observation := observeNodeRelease(run, nodes, resource)
+	if got, want := observation.Released, []string{"planned"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("released=%v, want %v", got, want)
+	}
+	if got, want := observation.Reused, []string{"planned"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("reused=%v, want %v", got, want)
+	}
+	decision := placementexecutor.EvaluateTerminal(run, false, observation)
+	if !decision.Succeeded || decision.Reason != state.ReasonExecutionCompleted {
+		t.Fatalf("decision=%+v, want successful %s", decision, state.ReasonExecutionCompleted)
+	}
+	message := enginestatus.PlacementMessage(run, resource, decision)
+	for _, want := range []string{"were evacuated", "already reused by unrelated workloads", "planned"} {
+		if !strings.Contains(message, want) {
+			t.Errorf("message %q does not contain %q", message, want)
+		}
+	}
+}
+
+func TestReplacementPlacedOnDrainTargetBlocksNodeRelease(t *testing.T) {
+	resource := v1.ResourceName("example.com/accelerator")
+	resourceOf := func(cards int64) *schedapi.Resource {
+		return &schedapi.Resource{ScalarResources: map[v1.ResourceName]float64{resource: float64(cards * 1000)}}
+	}
+	nodes := []*schedapi.NodeInfo{{
+		Name: "source", Allocatable: resourceOf(8), Used: resourceOf(2),
+		Tasks: map[schedapi.TaskID]*schedapi.TaskInfo{
+			"replacement-uid": {UID: "replacement-uid", Resreq: resourceOf(2)},
+		},
+	}}
+	run := &repackv1alpha1.RepackRun{Status: repackv1alpha1.RepackRunStatus{
+		Plan: &repackv1alpha1.RepackPlan{
+			Summary:    &repackv1alpha1.RepackSummary{},
+			FreedNodes: []string{"source"},
+			Moves: []repackv1alpha1.RepackMove{{
+				Namespace: "ns", PodGroupName: "pg",
+				Pods: []repackv1alpha1.PodMove{{Name: "victim", FromNode: "source", ToNode: "receiver"}},
+			}},
+		},
+		Result: &repackv1alpha1.RepackResult{MetricsVerified: true},
+		Relocations: []repackv1alpha1.PodRelocationStatus{{
+			Namespace: "ns", PodGroupName: "pg", VictimPodName: "victim", VictimPodUID: "victim-uid", PlannedNodeName: "receiver",
+			Eviction: repackv1alpha1.PodEvictionStatus{Phase: repackv1alpha1.PodEvictionAccepted},
+			Placement: repackv1alpha1.PodPlacementStatus{
+				Phase: repackv1alpha1.PodPlacementPlaced, ReplacementPodUID: "replacement-uid",
+				SelectedNodeName: "receiver", ActualNodeName: "source",
+			},
+		}},
+	}}
+
+	observation := observeNodeRelease(run, nodes, resource)
+	if got, want := observation.Blocked, []string{"source"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("blocked=%v, want %v", got, want)
+	}
+	decision := placementexecutor.EvaluateTerminal(run, false, observation)
 	if decision.Succeeded || decision.Reason != state.ReasonBenefitNotRealized {
 		t.Fatalf("decision=%+v, want failed %s", decision, state.ReasonBenefitNotRealized)
 	}
-	if got, want := decision.Nodes.Missing, []string{"planned"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("missing=%v, want %v", got, want)
+}
+
+func TestVictimStillVisibleKeepsNodeReleasePending(t *testing.T) {
+	resource := v1.ResourceName("example.com/accelerator")
+	resourceOf := func(cards int64) *schedapi.Resource {
+		return &schedapi.Resource{ScalarResources: map[v1.ResourceName]float64{resource: float64(cards * 1000)}}
+	}
+	nodes := []*schedapi.NodeInfo{{
+		Name: "source", Allocatable: resourceOf(8), Used: resourceOf(2),
+		Tasks: map[schedapi.TaskID]*schedapi.TaskInfo{
+			"victim-uid": {UID: "victim-uid", Resreq: resourceOf(2)},
+		},
+	}}
+	run := &repackv1alpha1.RepackRun{Status: repackv1alpha1.RepackRunStatus{
+		Plan: &repackv1alpha1.RepackPlan{
+			Summary:    &repackv1alpha1.RepackSummary{},
+			FreedNodes: []string{"source"},
+			Moves: []repackv1alpha1.RepackMove{{
+				Namespace: "ns", PodGroupName: "pg",
+				Pods: []repackv1alpha1.PodMove{{Name: "victim", FromNode: "source", ToNode: "receiver"}},
+			}},
+		},
+		Result: &repackv1alpha1.RepackResult{MetricsVerified: true},
+		Relocations: []repackv1alpha1.PodRelocationStatus{{
+			Namespace: "ns", PodGroupName: "pg", VictimPodName: "victim", VictimPodUID: "victim-uid", PlannedNodeName: "receiver",
+			Eviction: repackv1alpha1.PodEvictionStatus{Phase: repackv1alpha1.PodEvictionAccepted},
+			Placement: repackv1alpha1.PodPlacementStatus{
+				Phase: repackv1alpha1.PodPlacementPlaced, ReplacementPodUID: "replacement-uid",
+				SelectedNodeName: "receiver", ActualNodeName: "receiver",
+			},
+		}},
+	}}
+
+	observation := observeNodeRelease(run, nodes, resource)
+	if got, want := observation.Pending, []string{"source"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("pending=%v, want %v", got, want)
+	}
+	if len(observation.Released) != 0 || len(observation.Reused) != 0 {
+		t.Fatalf("observation=%+v, stale victim must not count as release or reuse", observation)
 	}
 }
 
@@ -624,7 +717,8 @@ func TestEvaluatePlacementTerminal(t *testing.T) {
 				Result:      &repackv1alpha1.RepackResult{FreedNodes: test.actualNodes, MetricsVerified: test.metricsVerified},
 				Relocations: relocations,
 			}}
-			got := placementexecutor.EvaluateTerminal(run, test.resultSnapshotUnavailable)
+			got := placementexecutor.EvaluateTerminal(run, test.resultSnapshotUnavailable,
+				placementexecutor.NodeReleaseObservation{Released: test.actualNodes})
 			if got.Succeeded != test.wantSucceeded || got.Reason != test.wantReason {
 				t.Fatalf("decision=%+v, want succeeded=%t reason=%s", got, test.wantSucceeded, test.wantReason)
 			}
@@ -672,7 +766,7 @@ func TestPlacementStatusMessageExplainsMissingPlannedNodes(t *testing.T) {
 		"node-b",
 		"2 replacement Pods were scheduled",
 		"1 alternative placement",
-		"inspect target-resource usage",
+		"inspect victim eviction and replacement placement",
 		"ns/old -> ns/new",
 	} {
 		if !strings.Contains(message, want) {

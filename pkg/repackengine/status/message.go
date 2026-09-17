@@ -44,13 +44,13 @@ func CompletionMessage(run *repackv1alpha1.RepackRun, targetResource v1.Resource
 	case state.ReasonExecutionCompleted:
 		result := Result(run)
 		return fmt.Sprintf(
-			"Repack completed for %s: moved %d PodGroups and %d cards, actually freed %d nodes; cluster fragmentation changed from %d%% to %d%%.",
+			"Repack completed for %s: moved %d PodGroups and %d cards; the terminal snapshot has %d planned nodes currently free, and cluster fragmentation changed from %d%% to %d%%.",
 			resource, acceptedPodGroupCount(run), result.MovedCards, result.FreedNodes, summary.FragBefore, result.FragAfter)
 	case state.ReasonExecutionCompletedWithAlternativePlacement:
 		result := Result(run)
 		_, alternativeNodePlacements, _ := PlacementOutcomeCounts(run)
 		return fmt.Sprintf(
-			"Repack completed for %s with %d replacement %s scheduled on alternative nodes: all planned nodes were verified free, %d cards were moved, and cluster fragmentation changed from %d%% to %d%%.",
+			"Repack completed for %s with %d replacement %s scheduled on alternative nodes: planned source workloads were evacuated, %d cards were moved, and cluster fragmentation changed from %d%% to %d%%.",
 			resource, alternativeNodePlacements, pluralNoun(alternativeNodePlacements, "Pod", "Pods"),
 			result.MovedCards, summary.FragBefore, result.FragAfter)
 	case state.ReasonNoFragmentation:
@@ -99,22 +99,30 @@ func PlacementMessage(run *repackv1alpha1.RepackRun, targetResource v1.ResourceN
 	selectedNodePlacements, alternativeNodePlacements, timedOutPlacements := PlacementOutcomeCounts(run)
 	resource := DisplayResource(targetResource)
 	plannedNodes := FormatNodeNames(decision.Nodes.Planned)
-	actualNodes := FormatNodeNames(decision.Nodes.Actual)
+	releasedNodes := FormatNodeNames(decision.Nodes.Actual)
+	currentlyFreeNodes := FormatNodeNames(decision.CurrentlyFree)
+	reusedNodes := FormatNodeNames(decision.Reused)
 	switch decision.Reason {
 	case state.ReasonExecutionCompleted:
 		return fmt.Sprintf(
-			"Repack succeeded for %s: all %d replacement %s were scheduled and all %d planned %s were verified free [%s]; cluster fragmentation changed from %d%% to %d%%.",
+			"Repack succeeded for %s: all %d replacement %s were scheduled and all %d planned source %s were evacuated [%s]. The terminal snapshot has %d currently target-resource-free planned %s [%s]; %d released %s were already reused by unrelated workloads [%s]. Cluster fragmentation changed from %d%% to %d%%.",
 			resource, selectedNodePlacements, pluralNoun(selectedNodePlacements, "Pod", "Pods"),
 			len(decision.Nodes.Planned), pluralNoun(len(decision.Nodes.Planned), "node", "nodes"),
-			plannedNodes, plan.FragBefore, result.FragAfter) + podGroupReplacementStatusSuffix(run)
+			plannedNodes,
+			len(decision.CurrentlyFree), pluralNoun(len(decision.CurrentlyFree), "node", "nodes"), currentlyFreeNodes,
+			len(decision.Reused), pluralNoun(len(decision.Reused), "node", "nodes"), reusedNodes,
+			plan.FragBefore, result.FragAfter) + podGroupReplacementStatusSuffix(run)
 	case state.ReasonExecutionCompletedWithAlternativePlacement:
 		return fmt.Sprintf(
-			"Repack succeeded for %s with alternative placement: all %d replacement %s were scheduled (%d reached selected nodes and %d used alternative nodes), and all %d planned %s were verified free [%s]; cluster fragmentation changed from %d%% to %d%%.",
+			"Repack succeeded for %s with alternative placement: all %d replacement %s were scheduled (%d reached selected nodes and %d used alternative nodes), and all %d planned source %s were evacuated [%s]. The terminal snapshot has %d currently target-resource-free planned %s [%s]; %d released %s were already reused by unrelated workloads [%s]. Cluster fragmentation changed from %d%% to %d%%.",
 			resource, selectedNodePlacements+alternativeNodePlacements,
 			pluralNoun(selectedNodePlacements+alternativeNodePlacements, "Pod", "Pods"),
 			selectedNodePlacements, alternativeNodePlacements,
 			len(decision.Nodes.Planned), pluralNoun(len(decision.Nodes.Planned), "node", "nodes"),
-			plannedNodes, plan.FragBefore, result.FragAfter) + podGroupReplacementStatusSuffix(run)
+			plannedNodes,
+			len(decision.CurrentlyFree), pluralNoun(len(decision.CurrentlyFree), "node", "nodes"), currentlyFreeNodes,
+			len(decision.Reused), pluralNoun(len(decision.Reused), "node", "nodes"), reusedNodes,
+			plan.FragBefore, result.FragAfter) + podGroupReplacementStatusSuffix(run)
 	case state.ReasonPlacementTimedOut:
 		return fmt.Sprintf(
 			"Repack failed for %s because %d replacement %s did not bind before the placement deadline; %d reached selected nodes and %d were placed elsewhere. Planned nodes [%s] were not accepted as a verified complete result; inspect Pod scheduling events and available receiver capacity.",
@@ -123,13 +131,13 @@ func PlacementMessage(run *repackv1alpha1.RepackRun, targetResource v1.ResourceN
 			podGroupReplacementStatusSuffix(run)
 	case state.ReasonResultVerificationFailed:
 		return fmt.Sprintf(
-			"Repack failed verification for %s: replacement bindings were reported, but the scheduler cache did not expose one coherent terminal snapshot before the deadline. Planned nodes [%s] cannot be confirmed free; inspect scheduler cache and Pod informer synchronization.",
+			"Repack failed verification for %s: replacement bindings were reported, but the scheduler cache did not expose one coherent terminal snapshot before the deadline. Planned source nodes [%s] cannot be confirmed evacuated; inspect scheduler cache and Pod informer synchronization.",
 			resource, plannedNodes) + podGroupReplacementStatusSuffix(run)
 	case state.ReasonBenefitNotRealized:
 		return fmt.Sprintf(
-			"Repack did not realize the planned benefit for %s: planned to free %d %s [%s], but verified %d %s free [%s]; nodes still occupied or unavailable: [%s]. All %d replacement %s were scheduled (%d %s); inspect target-resource usage on the missing nodes.",
+			"Repack did not realize the planned benefit for %s: planned to evacuate %d source %s [%s], but verified %d %s evacuated [%s]; nodes not released by this repack: [%s]. All %d replacement %s were scheduled (%d %s); inspect victim eviction and replacement placement on the missing nodes.",
 			resource, len(decision.Nodes.Planned), pluralNoun(len(decision.Nodes.Planned), "node", "nodes"), plannedNodes,
-			len(decision.Nodes.Actual), pluralNoun(len(decision.Nodes.Actual), "node", "nodes"), actualNodes,
+			len(decision.Nodes.Actual), pluralNoun(len(decision.Nodes.Actual), "node", "nodes"), releasedNodes,
 			FormatNodeNames(decision.Nodes.Missing),
 			selectedNodePlacements+alternativeNodePlacements,
 			pluralNoun(selectedNodePlacements+alternativeNodePlacements, "Pod", "Pods"),
@@ -137,8 +145,8 @@ func PlacementMessage(run *repackv1alpha1.RepackRun, targetResource v1.ResourceN
 			podGroupReplacementStatusSuffix(run)
 	default:
 		return fmt.Sprintf(
-			"Repack for %s reached terminal placement outcome %s: planned nodes [%s], actually free nodes [%s].",
-			resource, decision.Reason, plannedNodes, actualNodes)
+			"Repack for %s reached terminal placement outcome %s: planned source nodes [%s], released nodes [%s], currently free nodes [%s].",
+			resource, decision.Reason, plannedNodes, releasedNodes, currentlyFreeNodes)
 	}
 }
 

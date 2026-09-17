@@ -445,6 +445,7 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 			Result: &repackv1alpha1.RepackResult{MovedCardCount: 2},
 			Relocations: []repackv1alpha1.PodRelocationStatus{{
 				Namespace: ctx.Namespace, PodGroupName: oldPodGroupName, VictimPodName: victimPodName,
+				VictimPodUID:               syntheticVictimUID(ctx.Namespace, victimPodName),
 				SchedulingRequirementsHash: schedulingRequirementsHash,
 				PlannedNodeName:            nodes[1],
 				Eviction:                   acceptedEviction(),
@@ -585,6 +586,7 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 			Result: &repackv1alpha1.RepackResult{MovedCardCount: 2},
 			Relocations: []repackv1alpha1.PodRelocationStatus{{
 				Namespace: ctx.Namespace, PodGroupName: originalPodGroupName, VictimPodName: victimPodName,
+				VictimPodUID:    syntheticVictimUID(ctx.Namespace, victimPodName),
 				PlannedNodeName: nodes[1],
 				Eviction:        acceptedEviction(),
 				Placement:       repackv1alpha1.PodPlacementStatus{Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
@@ -759,12 +761,14 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 			Relocations: []repackv1alpha1.PodRelocationStatus{
 				{
 					Namespace: ctx.Namespace, PodGroupName: originalPodGroupName, VictimPodName: victimPodName,
+					VictimPodUID:    syntheticVictimUID(ctx.Namespace, victimPodName),
 					PlannedNodeName: nodes[1],
 					Eviction:        acceptedEviction(),
 					Placement:       repackv1alpha1.PodPlacementStatus{Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
 				},
 				{
 					Namespace: peerNamespace, PodGroupName: originalPodGroupName, VictimPodName: victimPodName,
+					VictimPodUID:    syntheticVictimUID(peerNamespace, victimPodName),
 					PlannedNodeName: nodes[2],
 					Eviction:        acceptedEviction(),
 					Placement:       repackv1alpha1.PodPlacementStatus{Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
@@ -929,16 +933,15 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 	// planned receiver and the only other idle node are both occupied, so the
 	// Engine nominates the occupied planned receiver verbatim and the scheduler
 	// overrides it, binding the replacement back onto the source node the plan
-	// meant to free. The Run must still fail on the unrealized plan, and the
-	// deadline must release the gate and the lease instead of stranding the
-	// workload.
+	// meant to free. The Run must still fail on the unrealized plan: unlike an
+	// unrelated workload, this replacement is part of the repack itself.
 	It("nominates an occupied planned receiver, lets the scheduler override it, and fails on the unrealized plan", func() {
 		restoreEngine := pauseRepackEngine(ctx)
 		defer restoreEngine()
 
 		occupy(ctx, "placement-planned-receiver-blocker", nodes[1], npuPerNode)
 		occupy(ctx, "placement-fallback-receiver-blocker", nodes[2], npuPerNode)
-		run, pgName, replacement := prepareGatedPlacement(ctx, "placement-expire", nodes[1], []string{nodes[0]}, time.Minute)
+		run, pgName, replacement := prepareGatedPlacement(ctx, "placement-own-replacement-reoccupies", nodes[1], []string{nodes[0]}, time.Minute)
 		defer deleteRun(ctx, run.Name)
 		Expect(hasSchedulingGate(replacement, repackv1alpha1.PlacementGateName)).To(BeTrue())
 
@@ -953,21 +956,22 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 			"the Engine nominates the planned receiver without checking whether it is idle")
 		got := waitTerminal(ctx, run.Name)
 		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackFailed))
-		Expect(completeReason(got)).To(Equal("ExecutionTimedOut"),
-			"the replacement landed elsewhere, so the planned source node was never freed")
+		Expect(completeReason(got)).To(Equal("BenefitNotRealized"),
+			"a replacement from this repack landed on the drain target, so the planned source was not released")
 		Expect(got.Status.Relocations[0].Placement.Phase).To(Equal(repackv1alpha1.PodPlacementPlaced))
 		Expect(got.Status.Relocations[0].Placement.ActualNodeName).To(Equal(nodes[0]),
 			"the scheduler overrides an unusable nomination and reuses the source node")
 		Expect(got.Status.Relocations[0].Placement.ActualNodeName).NotTo(Equal(got.Status.Relocations[0].Placement.SelectedNodeName))
 		Expect(got.Status.Result).NotTo(BeNil())
-		Expect(got.Status.Result.MetricsVerified).To(BeFalse())
+		Expect(got.Status.Result.MetricsVerified).To(BeTrue())
 		Expect(got.Status.Result.FreedNodes).NotTo(ContainElement(nodes[0]),
 			"the source node hosting the overridden replacement is not a freed node")
+		Expect(got.Status.Message).To(ContainSubstring("did not realize the planned benefit"))
 
 		Eventually(func() bool {
 			pod, err := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Get(context.TODO(), replacement.Name, metav1.GetOptions{})
 			return err == nil && !hasSchedulingGate(pod, repackv1alpha1.PlacementGateName)
-		}, repackTimeout, repackPoll).Should(BeTrue(), "deadline must release only the repack placement gate")
+		}, repackTimeout, repackPoll).Should(BeTrue(), "terminal cleanup must release only the repack placement gate")
 		assertPlacementLeaseReleased(ctx, pgName)
 	})
 
@@ -1025,36 +1029,34 @@ var _ = Describe("Repack placement protocol", Serial, func() {
 	})
 
 	// A replacement can bind successfully while unrelated concurrent work lands
-	// on the planned source node. Success is defined by the exact freed-node set,
-	// not only by replacement health, so this must be an operator-visible failure
-	// once the unified Execute deadline closes the node-freeing observation
-	// window.
-	It("fails when a replacement is placed but the exact planned node is not freed", func() {
+	// on the planned source node. The original victim has still been evacuated;
+	// the newly available capacity was simply reused before the terminal snapshot.
+	It("succeeds when an unrelated workload reuses a released planned node", func() {
 		restoreEngine := pauseRepackEngine(ctx)
 		defer restoreEngine()
 
 		run, pgName, replacement := prepareGatedPlacement(
-			ctx, "placement-benefit-missed", nodes[1], []string{nodes[0]}, 90*time.Second)
+			ctx, "placement-concurrent-reuse", nodes[1], []string{nodes[0]}, 90*time.Second)
 		defer deleteRun(ctx, run.Name)
 		Eventually(func() repackv1alpha1.PodPlacementPhase {
 			return getRun(ctx, run.Name).Status.Relocations[0].Placement.Phase
 		}, repackTimeout, repackPoll).Should(Equal(repackv1alpha1.PodPlacementWaitingForNodeSelection))
 
-		occupy(ctx, "placement-benefit-blocker", nodes[0], 1)
+		occupy(ctx, "placement-concurrent-user", nodes[0], 1)
 		restoreEngine()
 
 		got := waitTerminal(ctx, run.Name)
-		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackFailed))
-		Expect(completeReason(got)).To(Equal("ExecutionTimedOut"),
-			"the bound replacement cannot free the occupied planned node, so the unified Execute deadline must fail the Run")
+		Expect(got.Status.Phase).To(Equal(repackv1alpha1.RepackSucceeded))
+		Expect(completeReason(got)).To(Equal("ExecutionCompleted"),
+			"unrelated work consuming released capacity must not make the repack fail")
 		Expect(got.Status.Relocations[0].Placement.Phase).To(Equal(repackv1alpha1.PodPlacementPlaced),
-			"replacement health alone must not turn an unrealized plan into success")
+			"the replacement must still complete before the repack succeeds")
 		Expect(got.Status.Result).NotTo(BeNil())
-		Expect(got.Status.Result.MetricsVerified).To(BeFalse(),
-			"the planned node was never verified free, so the benefit is unverified")
-		Expect(got.Status.Result.FreedNodes).NotTo(ContainElement(nodes[0]))
-		Expect(got.Status.Message).To(ContainSubstring("result verification"),
-			"status.message must explain that the planned node-freeing result could not be verified")
+		Expect(got.Status.Result.MetricsVerified).To(BeTrue())
+		Expect(got.Status.Result.FreedNodes).NotTo(ContainElement(nodes[0]),
+			"result.freedNodes keeps its terminal currently-free semantics")
+		Expect(got.Status.Message).To(ContainSubstring("already reused by unrelated workloads"),
+			"status.message must distinguish successful release from terminal occupancy")
 		Eventually(func() bool {
 			pod, err := ctx.Kubeclient.CoreV1().Pods(ctx.Namespace).Get(
 				context.TODO(), replacement.Name, metav1.GetOptions{})
@@ -1154,6 +1156,7 @@ func prepareGatedPlacement(ctx *e2eutil.TestContext, name, plannedNode string, f
 		Result: &repackv1alpha1.RepackResult{MovedCardCount: 2},
 		Relocations: []repackv1alpha1.PodRelocationStatus{{
 			Namespace: ctx.Namespace, PodGroupName: pgName, VictimPodName: podName,
+			VictimPodUID:    syntheticVictimUID(ctx.Namespace, podName),
 			PlannedNodeName: plannedNode,
 			Eviction:        acceptedEviction(),
 			Placement:       repackv1alpha1.PodPlacementStatus{Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
@@ -1257,6 +1260,7 @@ func prepareGatedNativeReplacement(ctx *e2eutil.TestContext, name string, worklo
 		Result: &repackv1alpha1.RepackResult{MovedCardCount: 2},
 		Relocations: []repackv1alpha1.PodRelocationStatus{{
 			Namespace: ctx.Namespace, PodGroupName: workload.podGroup, VictimPodName: workload.podName,
+			VictimPodUID:    workload.podUID,
 			PlannedNodeName: plannedNode,
 			Eviction:        acceptedEviction(),
 			Placement:       repackv1alpha1.PodPlacementStatus{Phase: repackv1alpha1.PodPlacementWaitingForReplacement},
@@ -1284,6 +1288,12 @@ func prepareGatedNativeReplacement(ctx *e2eutil.TestContext, name string, worklo
 // describe an impossible in-flight RepackRun.
 func acceptedEviction() repackv1alpha1.PodEvictionStatus {
 	return repackv1alpha1.PodEvictionStatus{Phase: repackv1alpha1.PodEvictionAccepted}
+}
+
+// syntheticVictimUID gives hand-crafted post-eviction placement checkpoints
+// the same exact victim identity that production persists before eviction.
+func syntheticVictimUID(namespace, podName string) types.UID {
+	return types.UID(namespace + "-" + podName + "-victim")
 }
 
 // markPlacementReconciliationCheckpoint records the same durable stage barrier

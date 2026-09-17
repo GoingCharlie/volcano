@@ -39,6 +39,7 @@ import (
 func (e *Engine) finishPlacement(ctx context.Context, run *repackv1alpha1.RepackRun) engineframework.RuntimeResult {
 	placementTimedOut := false
 	resultSnapshotUnavailable := false
+	releaseObservation := placementexecutor.NodeReleaseObservation{}
 	for index := range run.Status.Relocations {
 		if run.Status.Relocations[index].Placement.Phase == repackv1alpha1.PodPlacementTimedOut {
 			placementTimedOut = true
@@ -66,7 +67,9 @@ func (e *Engine) finishPlacement(ctx context.Context, run *repackv1alpha1.Repack
 			placementexecutor.MarkBenefitUnverified(run)
 		} else {
 			updateActualExecuteResult(run, nodes, targetResource)
-			comparison, verificationPending := placementexecutor.FreedNodeVerificationPending(run, e.now())
+			releaseObservation = observeNodeRelease(run, nodes, targetResource)
+			comparison := placementexecutor.CompareNodeSets(run.Status.Plan.FreedNodes, releaseObservation.Released)
+			verificationPending := placementexecutor.NodeReleaseVerificationPending(run, releaseObservation, e.now())
 			schedframework.CloseSessionReadOnly(schedulerSession)
 			// Replacement binding and source-node resource release are observed
 			// through independent informer streams. A coherent scheduler snapshot
@@ -74,23 +77,23 @@ func (e *Engine) finishPlacement(ctx context.Context, run *repackv1alpha1.Repack
 			// terminating victim (or another stale source-node task) briefly.
 			// Do not turn that convergence window into a permanent failed Run.
 			//
-			// A genuinely occupied planned node is still a failed outcome: it
-			// remains unequal through the placement deadline and is evaluated
-			// below as BenefitNotRealized.
+			// Occupancy by an unrelated Pod is successful reuse. Only a stale
+			// original victim, an unobservable source, or this run's own
+			// replacement on a drain target prevents release verification.
 			if verificationPending {
-				klog.V(4).InfoS("repack: waiting for planned node-freeing observation to converge",
+				klog.V(4).InfoS("repack: waiting for planned node-release observation to converge",
 					"run", run.Name,
-					"plannedFreedNodes", comparison.Planned,
-					"actualFreedNodes", comparison.Actual,
-					"missingFreedNodes", comparison.Missing,
-					"unexpectedFreedNodes", comparison.Unexpected,
+					"plannedNodes", comparison.Planned,
+					"releasedNodes", comparison.Actual,
+					"pendingNodes", releaseObservation.Pending,
+					"blockedNodes", releaseObservation.Blocked,
 					"retryAfter", placementRetryInterval)
 				return engineframework.RuntimeResult{RequeueAfter: capAtExecutionDeadline(run, e.now(), placementRetryInterval)}
 			}
 		}
 	}
 
-	decision := placementexecutor.EvaluateTerminal(run, resultSnapshotUnavailable)
+	decision := placementexecutor.EvaluateTerminal(run, resultSnapshotUnavailable, releaseObservation)
 	message := enginestatus.PlacementMessage(run, targetResource, decision)
 	result := run.Status.Result
 	resultMetrics := enginestatus.Result(run)
@@ -101,14 +104,16 @@ func (e *Engine) finishPlacement(ctx context.Context, run *repackv1alpha1.Repack
 		"selectedNodePlacementCount", selectedNodePlacementCount,
 		"alternativeNodePlacementCount", alternativeNodePlacementCount,
 		"timedOutPlacementCount", timedOutPlacementCount,
-		"plannedFreedNodeCount", len(decision.Nodes.Planned), "actualFreedNodeCount", len(decision.Nodes.Actual),
-		"missingFreedNodeCount", len(decision.Nodes.Missing), "missingFreedNodes", enginestatus.FormatNodeNames(decision.Nodes.Missing),
-		"unexpectedFreedNodeCount", len(decision.Nodes.Unexpected),
+		"plannedNodeCount", len(decision.Nodes.Planned), "releasedNodeCount", len(decision.Nodes.Actual),
+		"currentlyFreeNodeCount", len(decision.CurrentlyFree), "reusedNodeCount", len(decision.Reused),
+		"missingReleasedNodeCount", len(decision.Nodes.Missing), "missingReleasedNodes", enginestatus.FormatNodeNames(decision.Nodes.Missing),
+		"pendingNodeCount", len(decision.Pending), "blockedNodeCount", len(decision.Blocked),
 		"fragAfterPercent", resultMetrics.FragAfter, "movedCardCount", resultMetrics.MovedCards)
-	klog.V(4).InfoS("repack: terminal node-freeing set comparison",
-		"run", run.Name, "plannedFreedNodes", decision.Nodes.Planned,
-		"actualFreedNodes", decision.Nodes.Actual, "missingFreedNodes", decision.Nodes.Missing,
-		"unexpectedFreedNodes", decision.Nodes.Unexpected, "setsEqual", decision.Nodes.Equal,
+	klog.V(4).InfoS("repack: terminal node-release result",
+		"run", run.Name, "plannedNodes", decision.Nodes.Planned,
+		"releasedNodes", decision.Nodes.Actual, "currentlyFreeNodes", decision.CurrentlyFree,
+		"reusedNodes", decision.Reused, "pendingNodes", decision.Pending, "blockedNodes", decision.Blocked,
+		"missingReleasedNodes", decision.Nodes.Missing, "setsEqual", decision.Nodes.Equal,
 		"result", result)
 	if decision.Succeeded {
 		state.MarkSucceeded(run, decision.Reason, message)
@@ -129,6 +134,144 @@ func (e *Engine) finishPlacement(ctx context.Context, run *repackv1alpha1.Repack
 		return runtimeError(fmt.Errorf("cleanup placement after terminal result: %w", err))
 	}
 	return engineframework.RuntimeResult{}
+}
+
+// observeNodeRelease verifies the causal result of this repack independently
+// from the node's instantaneous occupancy. An unrelated target-resource Pod is
+// evidence that released capacity has already been reused, not that eviction
+// failed. Exact victim/replacement UIDs keep a stale victim or a replacement
+// placed back on a drain target from being mistaken for unrelated reuse.
+func observeNodeRelease(
+	run *repackv1alpha1.RepackRun,
+	nodes []*schedapi.NodeInfo,
+	targetResource v1.ResourceName,
+) placementexecutor.NodeReleaseObservation {
+	observation := placementexecutor.NodeReleaseObservation{}
+	if run == nil || run.Status.Plan == nil {
+		return observation
+	}
+
+	plannedNodes := placementexecutor.SortedUniqueNodeNames(run.Status.Plan.FreedNodes)
+	plannedSet := make(map[string]struct{}, len(plannedNodes))
+	for _, nodeName := range plannedNodes {
+		plannedSet[nodeName] = struct{}{}
+	}
+
+	nodesByName := make(map[string]*schedapi.NodeInfo, len(nodes))
+	for _, node := range nodes {
+		if node != nil {
+			nodesByName[node.Name] = node
+		}
+	}
+
+	successfulRelocations := make(map[placementexecutor.Identity]*repackv1alpha1.PodRelocationStatus, len(run.Status.Relocations))
+	replacementUIDs := make(map[string]struct{}, len(run.Status.Relocations))
+	blocked := make(map[string]struct{})
+	pending := make(map[string]struct{})
+	for index := range run.Status.Relocations {
+		relocation := &run.Status.Relocations[index]
+		if (relocation.Eviction.Phase != repackv1alpha1.PodEvictionAccepted &&
+			relocation.Eviction.Phase != repackv1alpha1.PodEvictionIndirectlyRemoved) ||
+			relocation.Placement.Phase != repackv1alpha1.PodPlacementPlaced {
+			continue
+		}
+		successfulRelocations[placementexecutor.IdentityForRelocation(relocation)] = relocation
+		if relocation.Placement.ReplacementPodUID != "" {
+			replacementUIDs[string(relocation.Placement.ReplacementPodUID)] = struct{}{}
+		}
+		if _, isDrainTarget := plannedSet[relocation.Placement.ActualNodeName]; isDrainTarget {
+			blocked[relocation.Placement.ActualNodeName] = struct{}{}
+		}
+	}
+
+	hasPlannedVictim := make(map[string]bool, len(plannedNodes))
+	victimUIDsBySource := make(map[string]map[string]struct{}, len(plannedNodes))
+	for moveIndex := range run.Status.Plan.Moves {
+		move := &run.Status.Plan.Moves[moveIndex]
+		for podIndex := range move.Pods {
+			pod := &move.Pods[podIndex]
+			if _, planned := plannedSet[pod.FromNode]; !planned {
+				continue
+			}
+			hasPlannedVictim[pod.FromNode] = true
+			identity := placementexecutor.IdentityForMove(move.Namespace, move.PodGroupName, pod.Name, pod.ToNode)
+			relocation, successful := successfulRelocations[identity]
+			if !successful {
+				blocked[pod.FromNode] = struct{}{}
+				continue
+			}
+			if relocation.VictimPodUID == "" || relocation.Placement.ReplacementPodUID == "" {
+				pending[pod.FromNode] = struct{}{}
+				continue
+			}
+			if victimUIDsBySource[pod.FromNode] == nil {
+				victimUIDsBySource[pod.FromNode] = make(map[string]struct{})
+			}
+			victimUIDsBySource[pod.FromNode][string(relocation.VictimPodUID)] = struct{}{}
+		}
+	}
+
+	for _, nodeName := range plannedNodes {
+		if !hasPlannedVictim[nodeName] {
+			blocked[nodeName] = struct{}{}
+		}
+		if _, isBlocked := blocked[nodeName]; isBlocked {
+			observation.Blocked = append(observation.Blocked, nodeName)
+			continue
+		}
+
+		node := nodesByName[nodeName]
+		if node == nil || engineapi.Scalar(node.Allocatable, targetResource) <= 0 {
+			pending[nodeName] = struct{}{}
+		}
+		if _, isPending := pending[nodeName]; isPending {
+			observation.Pending = append(observation.Pending, nodeName)
+			continue
+		}
+
+		targetTaskCount := 0
+		reused := false
+		for taskID, task := range node.Tasks {
+			if task == nil || engineapi.Scalar(task.Resreq, targetResource) <= 0 {
+				continue
+			}
+			targetTaskCount++
+			uid := string(task.UID)
+			if uid == "" {
+				uid = string(taskID)
+			}
+			if _, originalVictim := victimUIDsBySource[nodeName][uid]; originalVictim {
+				pending[nodeName] = struct{}{}
+				continue
+			}
+			if _, ownReplacement := replacementUIDs[uid]; ownReplacement {
+				blocked[nodeName] = struct{}{}
+				continue
+			}
+			reused = true
+		}
+		if _, isBlocked := blocked[nodeName]; isBlocked {
+			observation.Blocked = append(observation.Blocked, nodeName)
+			continue
+		}
+		if _, isPending := pending[nodeName]; isPending {
+			observation.Pending = append(observation.Pending, nodeName)
+			continue
+		}
+		used := engineapi.Scalar(node.Used, targetResource)
+		if used > 0 && targetTaskCount == 0 {
+			// The aggregate says the resource is occupied but there is no Pod
+			// identity to attribute it to. Wait rather than guessing that it is
+			// unrelated reuse.
+			observation.Pending = append(observation.Pending, nodeName)
+			continue
+		}
+		observation.Released = append(observation.Released, nodeName)
+		if reused {
+			observation.Reused = append(observation.Reused, nodeName)
+		}
+	}
+	return observation
 }
 
 func updateActualExecuteResult(run *repackv1alpha1.RepackRun, nodes []*schedapi.NodeInfo, targetResource v1.ResourceName) {
@@ -183,16 +326,16 @@ func updateActualExecuteResult(run *repackv1alpha1.RepackRun, nodes []*schedapi.
 	run.Status.Result.FreedNodeCount = int32(len(actuallyFreedNodes))
 	run.Status.Result.MetricsVerified = true
 	comparison := placementexecutor.CompareFreedNodeSets(run)
-	klog.V(3).InfoS("repack: actual Execute benefit measured from scheduler snapshot",
+	klog.V(3).InfoS("repack: terminal scheduler snapshot metrics measured",
 		"run", run.Name, "resource", targetResource,
 		"fragAfterPercent", run.Status.Result.FragAfterPercent,
-		"freedNodeCount", run.Status.Result.FreedNodeCount,
+		"currentlyFreeNodeCount", run.Status.Result.FreedNodeCount,
 		"movedCardCount", run.Status.Result.MovedCardCount,
-		"plannedFreedNodeCount", len(comparison.Planned),
-		"missingFreedNodeCount", len(comparison.Missing), "missingFreedNodes", enginestatus.FormatNodeNames(comparison.Missing),
-		"unexpectedFreedNodeCount", len(comparison.Unexpected))
-	klog.V(4).InfoS("repack: actual Execute benefit node sets",
+		"plannedNodeCount", len(comparison.Planned),
+		"notCurrentlyFreeNodeCount", len(comparison.Missing), "notCurrentlyFreeNodes", enginestatus.FormatNodeNames(comparison.Missing),
+		"unexpectedFreeNodeCount", len(comparison.Unexpected))
+	klog.V(4).InfoS("repack: terminal scheduler snapshot node sets",
 		"run", run.Name, "resource", targetResource,
-		"plannedFreedNodes", comparison.Planned, "actualFreedNodes", comparison.Actual,
-		"missingFreedNodes", comparison.Missing, "unexpectedFreedNodes", comparison.Unexpected)
+		"plannedNodes", comparison.Planned, "currentlyFreeNodes", comparison.Actual,
+		"notCurrentlyFreeNodes", comparison.Missing, "unexpectedFreeNodes", comparison.Unexpected)
 }

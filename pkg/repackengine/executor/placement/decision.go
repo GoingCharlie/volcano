@@ -82,27 +82,68 @@ type FreedNodeComparison struct {
 	Equal      bool
 }
 
-type TerminalDecision struct {
-	Succeeded bool
-	Reason    string
-	Nodes     FreedNodeComparison
+// NodeReleaseObservation separates the causal outcome of this repack from the
+// instantaneous occupancy in the terminal scheduler snapshot. Released nodes
+// had their complete planned victim set relocated. Reused nodes are a subset of
+// Released that already carry unrelated target-resource Pods. Pending nodes
+// need informer/cache convergence; Blocked nodes have a definite plan failure.
+type NodeReleaseObservation struct {
+	Released []string
+	Reused   []string
+	Pending  []string
+	Blocked  []string
 }
 
-func EvaluateTerminal(run *repackv1alpha1.RepackRun, resultSnapshotUnavailable bool) TerminalDecision {
+type TerminalDecision struct {
+	Succeeded     bool
+	Reason        string
+	Nodes         FreedNodeComparison
+	CurrentlyFree []string
+	Reused        []string
+	Pending       []string
+	Blocked       []string
+}
+
+func EvaluateTerminal(
+	run *repackv1alpha1.RepackRun,
+	resultSnapshotUnavailable bool,
+	observation NodeReleaseObservation,
+) TerminalDecision {
 	_, alternativeNodePlacements, timedOut := outcomeCounts(run)
-	nodes := CompareFreedNodeSets(run)
+	var planned, currentlyFree []string
+	if run != nil && run.Status.Plan != nil {
+		planned = run.Status.Plan.FreedNodes
+	}
+	if run != nil && run.Status.Result != nil {
+		currentlyFree = run.Status.Result.FreedNodes
+	}
+	nodes := CompareNodeSets(planned, observation.Released)
+	decision := TerminalDecision{
+		Nodes:         nodes,
+		CurrentlyFree: SortedUniqueNodeNames(currentlyFree),
+		Reused:        SortedUniqueNodeNames(observation.Reused),
+		Pending:       SortedUniqueNodeNames(observation.Pending),
+		Blocked:       SortedUniqueNodeNames(observation.Blocked),
+	}
 	switch {
 	case timedOut > 0:
-		return TerminalDecision{Reason: state.ReasonPlacementTimedOut, Nodes: nodes}
+		decision.Reason = state.ReasonPlacementTimedOut
 	case resultSnapshotUnavailable || run == nil || run.Status.Result == nil || !run.Status.Result.MetricsVerified:
-		return TerminalDecision{Reason: state.ReasonResultVerificationFailed, Nodes: nodes}
+		decision.Reason = state.ReasonResultVerificationFailed
+	case len(decision.Blocked) > 0:
+		decision.Reason = state.ReasonBenefitNotRealized
+	case len(decision.Pending) > 0:
+		decision.Reason = state.ReasonResultVerificationFailed
 	case !nodes.Equal:
-		return TerminalDecision{Reason: state.ReasonBenefitNotRealized, Nodes: nodes}
+		decision.Reason = state.ReasonBenefitNotRealized
 	case alternativeNodePlacements > 0:
-		return TerminalDecision{Succeeded: true, Reason: state.ReasonExecutionCompletedWithAlternativePlacement, Nodes: nodes}
+		decision.Succeeded = true
+		decision.Reason = state.ReasonExecutionCompletedWithAlternativePlacement
 	default:
-		return TerminalDecision{Succeeded: true, Reason: state.ReasonExecutionCompleted, Nodes: nodes}
+		decision.Succeeded = true
+		decision.Reason = state.ReasonExecutionCompleted
 	}
+	return decision
 }
 
 func CompareFreedNodeSets(run *repackv1alpha1.RepackRun) FreedNodeComparison {
@@ -113,6 +154,10 @@ func CompareFreedNodeSets(run *repackv1alpha1.RepackRun) FreedNodeComparison {
 	if run != nil && run.Status.Result != nil {
 		actual = run.Status.Result.FreedNodes
 	}
+	return CompareNodeSets(planned, actual)
+}
+
+func CompareNodeSets(planned, actual []string) FreedNodeComparison {
 	result := FreedNodeComparison{Planned: SortedUniqueNodeNames(planned), Actual: SortedUniqueNodeNames(actual)}
 	plannedSet := make(map[string]struct{}, len(result.Planned))
 	actualSet := make(map[string]struct{}, len(result.Actual))
@@ -156,9 +201,8 @@ func ObservationDeadlinePassed(run *repackv1alpha1.RepackRun, now time.Time) boo
 		!now.Before(run.Status.ExecutionDeadline.Time)
 }
 
-func FreedNodeVerificationPending(run *repackv1alpha1.RepackRun, now time.Time) (FreedNodeComparison, bool) {
-	comparison := CompareFreedNodeSets(run)
-	return comparison, !comparison.Equal && !ObservationDeadlinePassed(run, now)
+func NodeReleaseVerificationPending(run *repackv1alpha1.RepackRun, observation NodeReleaseObservation, now time.Time) bool {
+	return len(observation.Blocked) == 0 && len(observation.Pending) > 0 && !ObservationDeadlinePassed(run, now)
 }
 
 func BindingsVisible(nodes []*schedapi.NodeInfo, relocations []repackv1alpha1.PodRelocationStatus) bool {
