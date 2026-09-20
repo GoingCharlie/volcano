@@ -1,0 +1,73 @@
+apiVersion: batch.volcano.sh/v1alpha1
+kind: Job
+metadata:
+  name: partition-migrate-__CASE__
+  namespace: __JOB_NAMESPACE__
+spec:
+  schedulerName: __SCHEDULER_NAME__
+  queue: __QUEUE_NAME__
+  minAvailable: 4
+  maxRetry: 5
+
+  # Keep the complete Job inside the real tier3 root used by this test.
+  networkTopology:
+    mode: hard
+    highestTierAllowed: 3
+
+  tasks:
+    - name: worker
+      replicas: 4
+      minAvailable: 4
+      policies:
+        - event: PodFailed
+          action: RestartPartition
+      partitionPolicy:
+        totalPartitions: 2
+        partitionSize: 2
+        minPartitions: 2
+        networkTopology:
+          mode: hard
+          highestTierAllowed: __TIER__
+      template:
+        metadata:
+          labels:
+            test.volcano.sh/case: "__CASE__"
+        spec:
+          restartPolicy: Never
+          nodeSelector:
+            test.volcano.sh/migration-case: "__CASE__"
+          containers:
+            - name: worker
+              image: __TEST_IMAGE__
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  echo "worker started on ${NODE_NAME}"
+                  while [ ! -f /work/fail ]; do
+                    sleep 1
+                  done
+                  echo "inject failure"
+                  exit 42
+              env:
+                - name: NODE_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: spec.nodeName
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 16Mi
+                  __ACCELERATOR_RESOURCE__: __CARDS_PER_POD__
+                limits:
+                  cpu: 100m
+                  memory: 64Mi
+                  __ACCELERATOR_RESOURCE__: __CARDS_PER_POD__
+              volumeMounts:
+                - name: work
+                  mountPath: /work
+          volumes:
+            - name: work
+              emptyDir: {}
+

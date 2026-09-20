@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: __VOLCANO_RELEASE__-controller-configmap
+  namespace: __VOLCANO_NAMESPACE__
+data:
+  volcano-controller.conf: |
+    networkTopologyDiscovery:
+      - source: label
+        enabled: true
+        interval: 1m
+        config:
+          networkTopologyTypes:
+            restartMigration:
+              # The label discoverer accepts labels from the highest domain to
+              # the lowest domain, followed by kubernetes.io/hostname.
+              - nodeLabel: "topology.volcano.sh/tier3"
+              - nodeLabel: "topology.volcano.sh/tier2"
+              - nodeLabel: "topology.volcano.sh/tier1"
+              - nodeLabel: "kubernetes.io/hostname"
+
