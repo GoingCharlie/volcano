@@ -1,0 +1,48 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: __SOURCE_STS__
+  namespace: __TEST_NAMESPACE__
+spec:
+  clusterIP: None
+  selector:
+    app: __SOURCE_STS__
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: __SOURCE_STS__
+  namespace: __TEST_NAMESPACE__
+spec:
+  serviceName: __SOURCE_STS__
+  replicas: 1
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: OnDelete
+  selector:
+    matchLabels:
+      app: __SOURCE_STS__
+  template:
+    metadata:
+      labels:
+        app: __SOURCE_STS__
+        repack-fix-test: source
+      annotations:
+        scheduling.volcano.sh/queue-name: __QUEUE_NAME__
+    spec:
+      schedulerName: __SCHEDULER_NAME__
+      terminationGracePeriodSeconds: 90
+      containers:
+        - name: worker
+          image: __TEST_IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              trap 'sleep 60; exit 0' TERM INT
+              while true; do sleep 5; done
+          resources:
+            requests:
+              __TARGET_RESOURCE__: "__TEST_POD_CARDS__"
+            limits:
+              __TARGET_RESOURCE__: "__TEST_POD_CARDS__"

@@ -1,0 +1,27 @@
+apiVersion: repack.volcano.sh/v1alpha1
+kind: RepackRun
+metadata:
+  name: __RUN_NAME__
+spec:
+  mode: Execute
+  scope:
+    podGroups:
+      include:
+        selector:
+          matchLabels:
+            repack-fix-test: source
+    nodes:
+      include:
+        names:
+          - __SOURCE_NODE__
+  goals:
+    - resource: __TARGET_RESOURCE__
+      minFragImprovementPercent: 0
+  maxPerRun:
+    podGroups: 1
+    resources:
+      __TARGET_RESOURCE__: "__TEST_POD_CARDS__"
+  eviction:
+    # 为脚本在 victim 进入 Terminating 后更新 StatefulSet 模板预留窗口。
+    gracePeriodSeconds: 90
+
