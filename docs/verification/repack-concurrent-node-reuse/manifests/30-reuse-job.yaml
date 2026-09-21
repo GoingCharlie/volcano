@@ -1,0 +1,35 @@
+apiVersion: batch.volcano.sh/v1alpha1
+kind: Job
+metadata:
+  name: __REUSE_JOB_NAME__
+  namespace: __TEST_NAMESPACE__
+  labels:
+    repack-reuse-test: concurrent-user
+spec:
+  minAvailable: 1
+  schedulerName: __SCHEDULER_NAME__
+  queue: __QUEUE_NAME__
+  maxRetry: 3
+  tasks:
+    - name: worker
+      replicas: 1
+      template:
+        metadata:
+          labels:
+            repack-reuse-test: concurrent-user
+        spec:
+          restartPolicy: Never
+          nodeSelector:
+            __SOURCE_NODE_LABEL_KEY__: "__SOURCE_NODE_LABEL_VALUE__"
+          containers:
+            - name: worker
+              image: __TEST_IMAGE__
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "-c"]
+              args: ["while true; do sleep 5; done"]
+              resources:
+                requests:
+                  __TARGET_RESOURCE__: "__REUSE_JOB_CARDS__"
+                limits:
+                  __TARGET_RESOURCE__: "__REUSE_JOB_CARDS__"
+
