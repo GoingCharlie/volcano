@@ -139,8 +139,9 @@ func (e *Engine) finishPlacement(ctx context.Context, run *repackv1alpha1.Repack
 // observeNodeRelease verifies the causal result of this repack independently
 // from the node's instantaneous occupancy. An unrelated target-resource Pod is
 // evidence that released capacity has already been reused, not that eviction
-// failed. Exact victim/replacement UIDs keep a stale victim or a replacement
-// placed back on a drain target from being mistaken for unrelated reuse.
+// failed. Exact victim/replacement UIDs keep a stale victim or a
+// target-resource-consuming replacement on a drain target from being mistaken
+// for unrelated reuse.
 func observeNodeRelease(
 	run *repackv1alpha1.RepackRun,
 	nodes []*schedapi.NodeInfo,
@@ -178,9 +179,6 @@ func observeNodeRelease(
 		successfulRelocations[placementexecutor.IdentityForRelocation(relocation)] = relocation
 		if relocation.Placement.ReplacementPodUID != "" {
 			replacementUIDs[string(relocation.Placement.ReplacementPodUID)] = struct{}{}
-		}
-		if _, isDrainTarget := plannedSet[relocation.Placement.ActualNodeName]; isDrainTarget {
-			blocked[relocation.Placement.ActualNodeName] = struct{}{}
 		}
 	}
 

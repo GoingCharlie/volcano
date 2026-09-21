@@ -591,6 +591,56 @@ func TestReplacementPlacedOnDrainTargetBlocksNodeRelease(t *testing.T) {
 	}
 }
 
+func TestReplacementWithoutTargetResourceOnDrainTargetReleasesNode(t *testing.T) {
+	resource := v1.ResourceName("example.com/accelerator")
+	resourceOf := func(cards int64) *schedapi.Resource {
+		return &schedapi.Resource{ScalarResources: map[v1.ResourceName]float64{resource: float64(cards * 1000)}}
+	}
+	nodes := []*schedapi.NodeInfo{{
+		Name: "source", Allocatable: resourceOf(8), Used: resourceOf(0),
+		Tasks: map[schedapi.TaskID]*schedapi.TaskInfo{
+			"replacement-uid": {UID: "replacement-uid", Resreq: resourceOf(0)},
+		},
+	}}
+	run := &repackv1alpha1.RepackRun{Status: repackv1alpha1.RepackRunStatus{
+		Plan: &repackv1alpha1.RepackPlan{
+			Summary:    &repackv1alpha1.RepackSummary{},
+			FreedNodes: []string{"source"},
+			Moves: []repackv1alpha1.RepackMove{{
+				Namespace: "ns", PodGroupName: "pg",
+				Pods: []repackv1alpha1.PodMove{{Name: "victim", FromNode: "source", ToNode: "receiver"}},
+			}},
+		},
+		Result: &repackv1alpha1.RepackResult{},
+		Relocations: []repackv1alpha1.PodRelocationStatus{{
+			Namespace: "ns", PodGroupName: "pg", VictimPodName: "victim", VictimPodUID: "victim-uid", PlannedNodeName: "receiver",
+			Eviction: repackv1alpha1.PodEvictionStatus{Phase: repackv1alpha1.PodEvictionAccepted},
+			Placement: repackv1alpha1.PodPlacementStatus{
+				Phase: repackv1alpha1.PodPlacementPlaced, ReplacementPodUID: "replacement-uid",
+				SelectedNodeName: "receiver", ActualNodeName: "source",
+			},
+		}},
+	}}
+
+	updateActualExecuteResult(run, nodes, resource)
+	if got, want := run.Status.Result.FreedNodes, []string{"source"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("freed nodes=%v, want %v", got, want)
+	}
+
+	observation := observeNodeRelease(run, nodes, resource)
+	if got, want := observation.Released, []string{"source"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("released=%v, want %v", got, want)
+	}
+	if len(observation.Blocked) != 0 || len(observation.Pending) != 0 || len(observation.Reused) != 0 {
+		t.Fatalf("observation=%+v, want a released and currently target-resource-free source node", observation)
+	}
+
+	decision := placementexecutor.EvaluateTerminal(run, false, observation)
+	if !decision.Succeeded || decision.Reason != state.ReasonExecutionCompletedWithAlternativePlacement {
+		t.Fatalf("decision=%+v, want successful %s", decision, state.ReasonExecutionCompletedWithAlternativePlacement)
+	}
+}
+
 func TestVictimStillVisibleKeepsNodeReleasePending(t *testing.T) {
 	resource := v1.ResourceName("example.com/accelerator")
 	resourceOf := func(cards int64) *schedapi.Resource {
