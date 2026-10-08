@@ -18,6 +18,7 @@ package hypernode
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -300,6 +301,192 @@ var _ = Describe("Network Topology Tests", func() {
 
 			By("Verify pods are pending")
 			Expect(e2eutil.WaitTaskPhase(ctx, topologyJob, []v1.PodPhase{v1.PodPending}, 2)).NotTo(HaveOccurred())
+		})
+
+		It("Case 1.4: Schedule minAvailable pods when no hypernode can fit all replicas", func() {
+			// Each kwok node has 8 CPU and 8 GiB memory. After reserving 4 CPU and 4 GiB
+			// on every node, a tier-1 hypernode can fit two, but not all four, job pods.
+			podSpecs := make([]e2eutil.PodSpec, 0, 8)
+			for i := 0; i < 8; i++ {
+				podSpecs = append(podSpecs, e2eutil.PodSpec{
+					Name:        fmt.Sprintf("case-1-4-pod-%d", i),
+					Node:        fmt.Sprintf("kwok-node-%d", i),
+					Req:         e2eutil.CPU4Mem4,
+					Tolerations: tolerations,
+				})
+			}
+
+			pods := make([]*v1.Pod, len(podSpecs))
+			for i, podSpec := range podSpecs {
+				pods[i] = e2eutil.CreatePod(ctx, podSpec)
+			}
+
+			defer func() {
+				for _, pod := range pods {
+					e2eutil.DeletePod(ctx, pod)
+				}
+			}()
+
+			By("Wait for all pods to be ready")
+			for _, pod := range pods {
+				Expect(e2eutil.WaitPodReady(ctx, pod)).NotTo(HaveOccurred())
+			}
+
+			job := &e2eutil.JobSpec{
+				Name: "job-1-4",
+				Min:  2,
+				NetworkTopology: &batchv1alpha1.NetworkTopologySpec{
+					Mode:               batchv1alpha1.HardNetworkTopologyMode,
+					HighestTierAllowed: ptr.To(1),
+				},
+				Tasks: []e2eutil.TaskSpec{
+					{
+						Name:        "task-1-4",
+						Img:         e2eutil.DefaultNginxImage,
+						Req:         e2eutil.CPU3Mem3,
+						Rep:         4,
+						Tolerations: tolerations,
+					},
+				},
+			}
+			topologyJob := e2eutil.CreateJob(ctx, job)
+
+			defer func() {
+				By("Delete job")
+				e2eutil.DeleteJob(ctx, topologyJob)
+			}()
+
+			By("Wait for minAvailable pods to be running")
+			Expect(e2eutil.WaitJobReady(ctx, topologyJob)).NotTo(HaveOccurred())
+			Expect(e2eutil.WaitTaskPhase(ctx, topologyJob, []v1.PodPhase{v1.PodPending}, 2)).NotTo(HaveOccurred())
+
+			By("Verify exactly minAvailable pods are running in the same tier-1 hypernode")
+			tierOneByNode := map[string]string{
+				"kwok-node-0": "s0",
+				"kwok-node-1": "s0",
+				"kwok-node-2": "s1",
+				"kwok-node-3": "s1",
+				"kwok-node-4": "s2",
+				"kwok-node-5": "s2",
+				"kwok-node-6": "s3",
+				"kwok-node-7": "s3",
+			}
+			runningNodes := make([]string, 0, topologyJob.Spec.MinAvailable)
+			pending := 0
+			for _, pod := range e2eutil.GetTasksOfJob(ctx, topologyJob) {
+				switch pod.Status.Phase {
+				case v1.PodRunning:
+					runningNodes = append(runningNodes, pod.Spec.NodeName)
+				case v1.PodPending:
+					pending++
+				}
+			}
+
+			Expect(runningNodes).To(HaveLen(int(topologyJob.Spec.MinAvailable)))
+			Expect(pending).To(Equal(2))
+			Expect(tierOneByNode[runningNodes[0]]).NotTo(BeEmpty())
+			Expect(tierOneByNode[runningNodes[1]]).To(Equal(tierOneByNode[runningNodes[0]]))
+		})
+
+		It("Case 1.5: Schedule the default subJob in a topology domain established by a required subJob", func() {
+			// Leave 4 CPU and 4 GiB on every node. A tier-1 hypernode can fit the
+			// required partition pod plus one default-subJob pod, but not all replicas.
+			podSpecs := make([]e2eutil.PodSpec, 0, 8)
+			for i := 0; i < 8; i++ {
+				podSpecs = append(podSpecs, e2eutil.PodSpec{
+					Name:        fmt.Sprintf("case-1-5-pod-%d", i),
+					Node:        fmt.Sprintf("kwok-node-%d", i),
+					Req:         e2eutil.CPU4Mem4,
+					Tolerations: tolerations,
+				})
+			}
+
+			pods := make([]*v1.Pod, len(podSpecs))
+			for i, podSpec := range podSpecs {
+				pods[i] = e2eutil.CreatePod(ctx, podSpec)
+			}
+
+			defer func() {
+				for _, pod := range pods {
+					e2eutil.DeletePod(ctx, pod)
+				}
+			}()
+
+			By("Wait for all pods to be ready")
+			for _, pod := range pods {
+				Expect(e2eutil.WaitPodReady(ctx, pod)).NotTo(HaveOccurred())
+			}
+
+			job := &e2eutil.JobSpec{
+				Name: "job-1-5",
+				Min:  2,
+				NetworkTopology: &batchv1alpha1.NetworkTopologySpec{
+					Mode:               batchv1alpha1.HardNetworkTopologyMode,
+					HighestTierAllowed: ptr.To(1),
+				},
+				Tasks: []e2eutil.TaskSpec{
+					{
+						Name:        "partitioned-task-1-5",
+						Img:         e2eutil.DefaultNginxImage,
+						Req:         e2eutil.CPU3Mem3,
+						Rep:         1,
+						Tolerations: tolerations,
+						PartitionPolicy: &batchv1alpha1.PartitionPolicySpec{
+							TotalPartitions: 1,
+							PartitionSize:   1,
+							MinPartitions:   1,
+							NetworkTopology: &batchv1alpha1.NetworkTopologySpec{
+								Mode:               batchv1alpha1.HardNetworkTopologyMode,
+								HighestTierAllowed: ptr.To(1),
+							},
+						},
+					},
+					{
+						Name:        "default-task-1-5",
+						Img:         e2eutil.DefaultNginxImage,
+						Req:         e2eutil.CPU3Mem3,
+						Rep:         2,
+						Tolerations: tolerations,
+					},
+				},
+			}
+			topologyJob := e2eutil.CreateJob(ctx, job)
+
+			defer func() {
+				By("Delete job")
+				e2eutil.DeleteJob(ctx, topologyJob)
+			}()
+
+			By("Wait for the real subJob and one default-subJob pod to be running")
+			Expect(e2eutil.WaitJobReady(ctx, topologyJob)).NotTo(HaveOccurred())
+			Expect(e2eutil.WaitTaskPhase(ctx, topologyJob, []v1.PodPhase{v1.PodPending}, 1)).NotTo(HaveOccurred())
+
+			By("Verify exactly minAvailable pods are running in the same tier-1 hypernode")
+			tierOneByNode := map[string]string{
+				"kwok-node-0": "s0",
+				"kwok-node-1": "s0",
+				"kwok-node-2": "s1",
+				"kwok-node-3": "s1",
+				"kwok-node-4": "s2",
+				"kwok-node-5": "s2",
+				"kwok-node-6": "s3",
+				"kwok-node-7": "s3",
+			}
+			runningNodes := make([]string, 0, topologyJob.Spec.MinAvailable)
+			pending := 0
+			for _, pod := range e2eutil.GetTasksOfJob(ctx, topologyJob) {
+				switch pod.Status.Phase {
+				case v1.PodRunning:
+					runningNodes = append(runningNodes, pod.Spec.NodeName)
+				case v1.PodPending:
+					pending++
+				}
+			}
+
+			Expect(runningNodes).To(HaveLen(int(topologyJob.Spec.MinAvailable)))
+			Expect(pending).To(Equal(1))
+			Expect(tierOneByNode[runningNodes[0]]).NotTo(BeEmpty())
+			Expect(tierOneByNode[runningNodes[1]]).To(Equal(tierOneByNode[runningNodes[0]]))
 		})
 	})
 
