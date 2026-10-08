@@ -633,6 +633,42 @@ func (ji *JobInfo) GetMinResources() *Resource {
 	return NewResource(*ji.PodGroup.Spec.MinResources)
 }
 
+// GetSubJobMinResources returns the minimum resources used to filter HyperNodes
+// for a subJob. The virtual default subJob represents the job-level gang, so it
+// uses PodGroup.MinResources instead of summing all pending replicas. Real
+// subJobs are fixed-size gangs and keep using all their pending members.
+func (ji *JobInfo) GetSubJobMinResources(subJob *SubJobInfo) *Resource {
+	if subJob == nil {
+		return EmptyResource()
+	}
+
+	if subJob.UID == ji.DefaultSubJobID() {
+		return ji.GetMinResources()
+	}
+
+	return subJob.GetMinResources()
+}
+
+// GetSubJobSearchAnchor returns the existing placement used to constrain a
+// subJob's HyperNode search. The virtual default subJob may not have allocated
+// any task yet even though a real subJob has already established the job's
+// topology domain. In that case, reuse the job-level placement. Besides keeping
+// the default subJob in the same domain, this applies the existing partially
+// running behavior that skips aggregate minimum-resource pre-filtering and lets
+// concrete task predicates determine whether the remaining pods fit.
+func (ji *JobInfo) GetSubJobSearchAnchor(subJob *SubJobInfo) string {
+	if subJob == nil {
+		return ""
+	}
+	if subJob.AllocatedHyperNode != "" {
+		return subJob.AllocatedHyperNode
+	}
+	if subJob.UID == ji.DefaultSubJobID() {
+		return ji.AllocatedHyperNode
+	}
+	return ""
+}
+
 // Get the total resources of tasks whose pod is scheduling gated
 // By definition, if a pod is scheduling gated, it's status is Pending
 // Note: Tasks that are only Volcano scheduling gated (scheduling.volcano.sh/queue-allocation-gate)

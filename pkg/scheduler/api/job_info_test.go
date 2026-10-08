@@ -25,6 +25,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -726,6 +727,87 @@ func TestSetPodGroupDeepCopiesNetworkTopology(t *testing.T) {
 
 	assert.Equal(t, scheduling.SoftNetworkTopologyMode, job.PodGroup.Spec.NetworkTopology.Mode)
 	assert.Equal(t, "volcano.sh/hypercluster", job.PodGroup.Spec.NetworkTopology.HighestTierName)
+}
+
+func TestGetSubJobMinResourcesUsesPodGroupMinResourcesForDefaultSubJob(t *testing.T) {
+	jobID := JobID("job")
+	owner := buildOwnerReference(string(jobID))
+	task1 := NewTaskInfo(buildPod("ns", "p1", "", v1.PodPending,
+		BuildResourceList("2", "4G"), []metav1.OwnerReference{owner}, nil))
+	task2 := NewTaskInfo(buildPod("ns", "p2", "", v1.PodPending,
+		BuildResourceList("2", "4G"), []metav1.OwnerReference{owner}, nil))
+	job := NewJobInfo(jobID, task1, task2)
+
+	minResources := BuildResourceList("2", "4G")
+	job.SetPodGroup(&PodGroup{PodGroup: scheduling.PodGroup{
+		Spec: scheduling.PodGroupSpec{
+			MinMember:    1,
+			MinResources: &minResources,
+		},
+	}})
+
+	defaultSubJob := job.SubJobs[job.DefaultSubJobID()]
+	require.NotNil(t, defaultSubJob)
+	assert.Equal(t, float64(4000), defaultSubJob.GetMinResources().MilliCPU,
+		"the legacy subJob calculation sums all pending replicas")
+
+	got := job.GetSubJobMinResources(defaultSubJob)
+	assert.Equal(t, float64(2000), got.MilliCPU)
+	assert.Equal(t, float64(4*1000*1000*1000), got.Memory)
+}
+
+func TestDefaultSubJobUsesJobMinResourcesAndSearchAnchorWithPolicy(t *testing.T) {
+	jobID := JobID("job")
+	owner := buildOwnerReference(string(jobID))
+	allocatedSubGroupTask := NewTaskInfo(buildPod("ns", "partition-0", "node-1", v1.PodRunning,
+		BuildResourceList("3", "1G"), []metav1.OwnerReference{owner}, map[string]string{"partition-id": "0"}))
+	defaultTask1 := NewTaskInfo(buildPod("ns", "default-1", "", v1.PodPending,
+		BuildResourceList("2", "4G"), []metav1.OwnerReference{owner}, nil))
+	defaultTask2 := NewTaskInfo(buildPod("ns", "default-2", "", v1.PodPending,
+		BuildResourceList("2", "4G"), []metav1.OwnerReference{owner}, nil))
+	job := NewJobInfo(jobID, allocatedSubGroupTask, defaultTask1, defaultTask2)
+
+	subGroupSize := int32(1)
+	minResources := BuildResourceList("4", "8G")
+	job.SetPodGroup(&PodGroup{PodGroup: scheduling.PodGroup{
+		Spec: scheduling.PodGroupSpec{
+			MinMember:    2,
+			MinResources: &minResources,
+			SubGroupPolicy: []scheduling.SubGroupPolicySpec{
+				{
+					Name:           "partition",
+					MatchLabelKeys: []string{"partition-id"},
+					SubGroupSize:   &subGroupSize,
+				},
+			},
+		},
+	}})
+
+	defaultSubJob := job.SubJobs[job.DefaultSubJobID()]
+	require.NotNil(t, defaultSubJob)
+	assert.True(t, job.ContainsSubJobPolicy())
+	assert.Equal(t, float64(4000), defaultSubJob.GetMinResources().MilliCPU,
+		"the default subJob still contains both pending replicas")
+
+	got := job.GetSubJobMinResources(defaultSubJob)
+	assert.Equal(t, float64(4000), got.MilliCPU,
+		"allocated pods must not be subtracted dimension by dimension from PodGroup.MinResources")
+	assert.Equal(t, float64(8*1000*1000*1000), got.Memory)
+
+	job.AllocatedHyperNode = "s0"
+	assert.Empty(t, defaultSubJob.AllocatedHyperNode)
+	assert.Equal(t, "s0", job.GetSubJobSearchAnchor(defaultSubJob),
+		"the virtual default subJob should reuse the partially allocated job's topology domain")
+
+	defaultSubJob.AllocatedHyperNode = "s1"
+	assert.Equal(t, "s1", job.GetSubJobSearchAnchor(defaultSubJob),
+		"a subJob's own placement takes precedence over the job-level fallback")
+
+	realSubJob := job.SubJobs[job.TaskToSubJob[allocatedSubGroupTask.UID]]
+	require.NotNil(t, realSubJob)
+	assert.NotEqual(t, defaultSubJob.UID, realSubJob.UID)
+	assert.Empty(t, job.GetSubJobSearchAnchor(realSubJob),
+		"a real subJob must not inherit another subJob's placement through the job anchor")
 }
 
 func TestParseMinMemberInfoChanged(t *testing.T) {

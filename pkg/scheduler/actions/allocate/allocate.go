@@ -683,17 +683,19 @@ func (alloc *Action) allocateForSubJobInCandidateForest(
 			ssn.HyperNodes, hyperNodeGradients, allowedRoots, gradientStats,
 		)
 	}
+	subJobMinResource := job.GetSubJobMinResources(subJob)
+	subJobSearchAnchor := job.GetSubJobSearchAnchor(subJob)
 	hyperNodeGradients, resourceStats := FilterGradientsByMinResource(
-		ssn, hyperNodeGradients, subJob.GetMinResources(), subJob.AllocatedHyperNode,
+		ssn, hyperNodeGradients, subJobMinResource, subJobSearchAnchor,
 	)
 	if len(hyperNodeGradients) == 0 {
 		job.MergeSubJobHyperNodeFitErrors(jobHyperNodeBaseline, subJob.UID, gradientStats, resourceStats,
-			subJob.GetMinResources(), ssn.HyperNodesSetByTier, ssn.HyperNodeTierNameMap, ssn.HyperNodes)
+			subJobMinResource, ssn.HyperNodesSetByTier, ssn.HyperNodeTierNameMap, ssn.HyperNodes)
 		klog.V(3).Infof("No hyperNode gradient for subJob, job=%s, subJob=%s, fitError=%s", subJob.Job, subJob.UID, job.JobFitErrors)
 		return nil, 0
 	}
 	klog.V(3).Infof("HyperNode screening for subJob, job=%s, subJob=%s, fitError=%s", subJob.Job, subJob.UID,
-		api.FormatHyperNodeFitSummary(gradientStats, resourceStats, subJob.GetMinResources(),
+		api.FormatHyperNodeFitSummary(gradientStats, resourceStats, subJobMinResource,
 			ssn.HyperNodesSetByTier, ssn.HyperNodeTierNameMap, ssn.HyperNodes))
 	if gradientStats != nil && len(gradientStats.ExcludedByReason) > 0 {
 		klog.V(3).Infof("HyperNode excluded by plugin, job=%s, subJob=%s, excluded=%v", subJob.Job, subJob.UID,

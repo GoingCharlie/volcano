@@ -365,10 +365,16 @@ func (nta *networkTopologyAwarePlugin) hyperNodeGradientForSubJob(
 	if !hardMode {
 		return api.HyperNodeGradientAbstain()
 	}
-	result, err := nta.hyperNodeGradientFn(ssn, hyperNode, highestAllowedTier, subJob.AllocatedHyperNode, subJob.GetMinResources(), purpose)
+	minResource := subJob.GetMinResources()
+	searchAnchor := subJob.AllocatedHyperNode
+	if job, found := ssn.Jobs[subJob.Job]; found {
+		minResource = job.GetSubJobMinResources(subJob)
+		searchAnchor = job.GetSubJobSearchAnchor(subJob)
+	}
+	result, err := nta.hyperNodeGradientFn(ssn, hyperNode, highestAllowedTier, searchAnchor, minResource, purpose)
 	if err != nil {
 		klog.Errorf("build hyperNode gradient fail, subJob=%s, hyperNode=%s, highestAllowedTier=%d, allocatedHyperNode=%s, err=%v",
-			subJob.UID, hyperNode.Name, highestAllowedTier, subJob.AllocatedHyperNode, err)
+			subJob.UID, hyperNode.Name, highestAllowedTier, searchAnchor, err)
 		return api.HyperNodeGradientConstrain(emptyHyperNodeGradients)
 	}
 	if purpose == api.PurposeEvict {
