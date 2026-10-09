@@ -190,6 +190,9 @@ func applyPolicies(job *batch.Job, req *apis.Request) (delayAct *delayAction) {
 		// default action is sync job
 		action: v1alpha1.SyncJobAction,
 	}
+	if job != nil {
+		delayAct.jobUID = job.UID
+	}
 
 	// Solve the scenario: When pod events accumulate and vcjobs with the same name are frequently created,
 	// it is easy for the pod to cause abnormal status of the newly created vcjob with the same name.

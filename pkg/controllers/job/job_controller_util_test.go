@@ -990,6 +990,42 @@ func TestApplyPolicies(t *testing.T) {
 	}
 }
 
+func TestApplyPoliciesCapturesJobUIDForDelayedAction(t *testing.T) {
+	timeout := 30 * time.Second
+	job := &v1alpha1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "job",
+			Namespace: "default",
+			UID:       "job-uid",
+		},
+		Spec: v1alpha1.JobSpec{
+			Policies: []v1alpha1.LifecyclePolicy{
+				{
+					Event:  busv1alpha1.JobUnknownEvent,
+					Action: busv1alpha1.RestartJobAction,
+					Timeout: &metav1.Duration{
+						Duration: timeout,
+					},
+				},
+			},
+		},
+	}
+	req := &apis.Request{
+		Namespace: "default",
+		JobName:   "job",
+		Event:     busv1alpha1.JobUnknownEvent,
+	}
+
+	delayAct := applyPolicies(job, req)
+	if delayAct.jobUID != job.UID {
+		t.Fatalf("captured job UID = %q, want %q", delayAct.jobUID, job.UID)
+	}
+	if delayAct.action != busv1alpha1.RestartJobAction || delayAct.delay != timeout {
+		t.Fatalf("delayed action = %q after %v, want %q after %v",
+			delayAct.action, delayAct.delay, busv1alpha1.RestartJobAction, timeout)
+	}
+}
+
 func TestTasksPriority_Less(t *testing.T) {
 	testcases := []struct {
 		Name          string
@@ -1511,7 +1547,6 @@ func TestDelayedActionExpirationEnqueuesExplicitAction(t *testing.T) {
 	req := apis.Request{
 		Namespace:   "default",
 		JobName:     "job",
-		JobUid:      "job-uid",
 		TaskName:    "worker",
 		PodName:     "worker-0",
 		PodUID:      "pod-uid",
@@ -1521,6 +1556,7 @@ func TestDelayedActionExpirationEnqueuesExplicitAction(t *testing.T) {
 	}
 	delayAct := &delayAction{
 		jobKey:    "default/job",
+		jobUID:    "job-uid",
 		taskName:  req.TaskName,
 		podName:   req.PodName,
 		podUID:    req.PodUID,
@@ -1546,7 +1582,7 @@ func TestDelayedActionExpirationEnqueuesExplicitAction(t *testing.T) {
 	if got.Action != delayAct.action {
 		t.Fatalf("queued action = %q, want %q", got.Action, delayAct.action)
 	}
-	if got.JobUid != req.JobUid || got.PodUID != req.PodUID || got.JobVersion != req.JobVersion {
+	if got.JobUid != delayAct.jobUID || got.PodUID != req.PodUID || got.JobVersion != req.JobVersion {
 		t.Fatalf("queued request lost identity fields: %#v", got)
 	}
 
@@ -1566,6 +1602,7 @@ func TestDelayedPartitionActionsAreCoalescedByTaskAndPartition(t *testing.T) {
 		req := apis.Request{
 			Namespace:   "default",
 			JobName:     "job",
+			JobUid:      "job-uid",
 			TaskName:    "worker",
 			PodName:     podName,
 			PodUID:      types.UID(podName + "-uid"),
@@ -1574,6 +1611,7 @@ func TestDelayedPartitionActionsAreCoalescedByTaskAndPartition(t *testing.T) {
 		}
 		cc.AddDelayActionForJob(req, &delayAction{
 			jobKey:    "default/job",
+			jobUID:    req.JobUid,
 			taskName:  req.TaskName,
 			podName:   req.PodName,
 			podUID:    req.PodUID,
@@ -1599,6 +1637,7 @@ func TestDelayedActionForRecreatedPodReplacesStaleTimer(t *testing.T) {
 		req := apis.Request{
 			Namespace: "default",
 			JobName:   "job",
+			JobUid:    "job-uid",
 			TaskName:  "worker",
 			PodName:   "worker-0",
 			PodUID:    types.UID(uid),
@@ -1606,6 +1645,7 @@ func TestDelayedActionForRecreatedPodReplacesStaleTimer(t *testing.T) {
 		}
 		cc.AddDelayActionForJob(req, &delayAction{
 			jobKey:   "default/job",
+			jobUID:   req.JobUid,
 			taskName: req.TaskName,
 			podName:  req.PodName,
 			podUID:   req.PodUID,
@@ -1633,4 +1673,96 @@ func TestDelayedActionForRecreatedPodReplacesStaleTimer(t *testing.T) {
 	if got := queue.Len(); got != 0 {
 		t.Fatalf("stale timer enqueued %d additional actions", got)
 	}
+}
+
+func TestOldJobDelayedActionDoesNotCancelNewJobTimer(t *testing.T) {
+	cc := newDelayedActionTestController(t)
+
+	oldReq := apis.Request{
+		Namespace: "default",
+		JobName:   "job",
+		JobUid:    "old-job-uid",
+		TaskName:  "worker",
+		PodName:   "old-worker-0",
+		PodUID:    "old-pod-uid",
+		Event:     busv1alpha1.PodPendingEvent,
+	}
+	oldDelayAct := &delayAction{
+		jobKey:    "default/job",
+		jobUID:    oldReq.JobUid,
+		taskName:  oldReq.TaskName,
+		podName:   oldReq.PodName,
+		podUID:    oldReq.PodUID,
+		partition: "0",
+		event:     oldReq.Event,
+		action:    busv1alpha1.RestartPartitionAction,
+		delay:     time.Hour,
+	}
+	newReq := apis.Request{
+		Namespace: "default",
+		JobName:   "job",
+		JobUid:    "new-job-uid",
+		TaskName:  "worker",
+		PodName:   "new-worker-0",
+		PodUID:    "new-pod-uid",
+		Event:     busv1alpha1.PodPendingEvent,
+	}
+	newDelayAct := &delayAction{
+		jobKey:    "default/job",
+		jobUID:    newReq.JobUid,
+		taskName:  newReq.TaskName,
+		podName:   newReq.PodName,
+		podUID:    newReq.PodUID,
+		partition: "0",
+		event:     newReq.Event,
+		action:    busv1alpha1.RestartPartitionAction,
+		delay:     time.Hour,
+	}
+
+	cc.AddDelayActionForJob(oldReq, oldDelayAct)
+	cc.AddDelayActionForJob(newReq, newDelayAct)
+	if !cc.claimDelayAction(oldDelayAct) {
+		t.Fatal("old Job timer could not be claimed")
+	}
+
+	cc.delayActionMapLock.RLock()
+	registered := cc.delayActionMap[newDelayAct.jobKey][newDelayAct.podName]
+	cc.delayActionMapLock.RUnlock()
+	if registered != newDelayAct {
+		t.Fatal("old Job timer removed the replacement Job timer")
+	}
+	cc.cleanupDelayActions(newDelayAct)
+}
+
+func TestNewJobTimerReplacesSameKeyOldJobTimer(t *testing.T) {
+	cc := newDelayedActionTestController(t)
+	req := apis.Request{Namespace: "default", JobName: "job", Event: busv1alpha1.JobUnknownEvent}
+	oldDelayAct := &delayAction{
+		jobKey: "default/job",
+		jobUID: "old-job-uid",
+		event:  req.Event,
+		action: busv1alpha1.RestartJobAction,
+		delay:  time.Hour,
+	}
+	newDelayAct := &delayAction{
+		jobKey: "default/job",
+		jobUID: "new-job-uid",
+		event:  req.Event,
+		action: busv1alpha1.RestartJobAction,
+		delay:  time.Hour,
+	}
+
+	cc.AddDelayActionForJob(req, oldDelayAct)
+	cc.AddDelayActionForJob(req, newDelayAct)
+
+	cc.delayActionMapLock.RLock()
+	registered := cc.delayActionMap[newDelayAct.jobKey][newDelayAct.podName]
+	cc.delayActionMapLock.RUnlock()
+	if registered != newDelayAct {
+		t.Fatal("replacement Job timer was deduplicated against the old Job timer")
+	}
+	if cc.claimDelayAction(oldDelayAct) {
+		t.Fatal("replaced old Job timer was still claimable")
+	}
+	cc.cleanupDelayActions(newDelayAct)
 }

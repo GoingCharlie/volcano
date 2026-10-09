@@ -66,6 +66,9 @@ type delayAction struct {
 	// The namespacing name of the job
 	jobKey string
 
+	// The UID of the job when the delayed action was registered.
+	jobUID types.UID
+
 	// The name of the task
 	taskName string
 
@@ -429,6 +432,11 @@ func (cc *jobcontroller) CleanPodDelayActionsIfNeed(req apis.Request) {
 
 		if taskMap, exists := cc.delayActionMap[key]; exists {
 			if delayAct, exists := taskMap[req.PodName]; exists {
+				// An event from an old Job with the same namespace and name must
+				// not cancel a delayed action registered for the replacement Job.
+				if req.JobUid != delayAct.jobUID {
+					return
+				}
 				shouldCancel := false
 
 				if delayAct.event == busv1alpha1.PodPendingEvent {
@@ -475,7 +483,9 @@ func (cc *jobcontroller) AddDelayActionForJob(req apis.Request, delayAct *delayA
 		cc.delayActionMap[delayAct.jobKey] = m
 	}
 	if oldDelayAct, exists := m[delayAct.podName]; exists {
-		if oldDelayAct.action == delayAct.action && oldDelayAct.podUID == delayAct.podUID {
+		if oldDelayAct.action == delayAct.action &&
+			oldDelayAct.jobUID == delayAct.jobUID &&
+			oldDelayAct.podUID == delayAct.podUID {
 			return
 		}
 		// A pod with the same name can be recreated with a new UID, or a new
@@ -507,6 +517,11 @@ func (cc *jobcontroller) AddDelayActionForJob(req apis.Request, delayAct *delayA
 		klog.V(4).Infof("Job<%s/%s>'s delayed action %s is expired, enqueue it", req.Namespace, req.JobName, delayAct.action)
 
 		actionReq := req
+		// Some event sources, such as PodGroup JobUnknownEvent, do not carry
+		// the Job UID. Use the UID captured when the timer was registered so
+		// the explicit action cannot affect a replacement Job with the same
+		// namespace and name.
+		actionReq.JobUid = delayAct.jobUID
 		actionReq.Action = delayAct.action
 		queue := cc.getWorkerQueue(delayAct.jobKey)
 		queue.Add(actionReq)
@@ -594,6 +609,10 @@ func (cc *jobcontroller) cleanupDelayActionsLocked(currentDelayAction *delayActi
 }
 
 func sameDelayActionScope(currentDelayAction, delayAct *delayAction) bool {
+	if delayAct.jobUID != currentDelayAction.jobUID {
+		return false
+	}
+
 	actionType := GetActionType(currentDelayAction.action)
 	if GetActionType(delayAct.action) != actionType {
 		return false
