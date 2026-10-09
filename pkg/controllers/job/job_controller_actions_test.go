@@ -27,6 +27,7 @@ import (
 	"github.com/agiledragon/gomonkey/v2"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 
@@ -1013,6 +1014,16 @@ func TestDeleteJobPod(t *testing.T) {
 			err := fakeController.deleteJobPod(testcase.Job.Name, testcase.DeletePod)
 			if err != testcase.ExpextVal {
 				t.Errorf("Expected return value to be equal to expected: %s, but got: %s", testcase.ExpextVal, err)
+			}
+
+			actions := fakeController.kubeClient.(interface{ Actions() []k8stesting.Action }).Actions()
+			deleteAction, ok := actions[len(actions)-1].(k8stesting.DeleteAction)
+			if !ok {
+				t.Fatalf("last client action has type %T, want DeleteAction", actions[len(actions)-1])
+			}
+			preconditions := deleteAction.GetDeleteOptions().Preconditions
+			if preconditions == nil || preconditions.UID == nil || *preconditions.UID != testcase.DeletePod.UID {
+				t.Fatalf("delete UID precondition = %#v, want %q", preconditions, testcase.DeletePod.UID)
 			}
 
 			_, err = fakeController.kubeClient.CoreV1().Pods(namespace).Get(context.TODO(), "job1-task1-0", metav1.GetOptions{})

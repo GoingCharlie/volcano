@@ -379,6 +379,10 @@ func (cc *jobcontroller) processNextReq(count uint32) bool {
 		cc.recordJobEvent(jobInfo.Job.Namespace, jobInfo.Job.Name, batchv1alpha1.ExecuteAction, fmt.Sprintf(
 			"Execute action %s after %s", delayAct.action, delayAct.delay.String()))
 		cc.AddDelayActionForJob(req, delayAct)
+		// Registering the timer successfully handles the current request. The
+		// eventual action is enqueued as a new, explicit request when the timer
+		// expires.
+		queue.Forget(req)
 		return true
 	}
 
@@ -445,6 +449,9 @@ func (cc *jobcontroller) CleanPodDelayActionsIfNeed(req apis.Request) {
 					klog.V(3).Infof("Cancel delayed action <%v> for pod <%s> because of event <%s> of Job <%s>", delayAct.action, req.PodName, req.Event, delayAct.jobKey)
 					delayAct.cancel()
 					delete(taskMap, req.PodName)
+					if len(taskMap) == 0 {
+						delete(cc.delayActionMap, key)
+					}
 				}
 			}
 		}
@@ -467,45 +474,63 @@ func (cc *jobcontroller) AddDelayActionForJob(req apis.Request, delayAct *delayA
 		m = make(map[string]*delayAction)
 		cc.delayActionMap[delayAct.jobKey] = m
 	}
-	if oldDelayAct, exists := m[req.PodName]; exists && oldDelayAct.action == delayAct.action {
-		return
+	if oldDelayAct, exists := m[delayAct.podName]; exists {
+		if oldDelayAct.action == delayAct.action && oldDelayAct.podUID == delayAct.podUID {
+			return
+		}
+		// A pod with the same name can be recreated with a new UID, or a new
+		// policy can supersede the old action. Do not let the stale timer act on
+		// the replacement pod.
+		if oldDelayAct.cancel != nil {
+			oldDelayAct.cancel()
+		}
 	}
-	m[req.PodName] = delayAct
+	m[delayAct.podName] = delayAct
 
 	ctx, cancel := context.WithTimeout(context.Background(), delayAct.delay)
 	delayAct.cancel = cancel
 
 	go func() {
 		<-ctx.Done()
-		if ctx.Err() == context.Canceled {
+		if ctx.Err() != context.DeadlineExceeded {
 			klog.V(4).Infof("Job<%s/%s>'s delayed action %s is canceled", req.Namespace, req.JobName, delayAct.action)
 			return
 		}
 
-		klog.V(4).Infof("Job<%s/%s>'s delayed action %s is expired, execute it", req.Namespace, req.JobName, delayAct.action)
-
-		jobInfo, err := cc.cache.Get(delayAct.jobKey)
-		if err != nil {
-			klog.Errorf("Failed to get job by <%v> from cache: %v", req, err)
+		// Only one expired timer in the same action scope is allowed to enqueue
+		// work. This also rejects timers that were replaced by a newer pod UID.
+		if !cc.claimDelayAction(delayAct) {
+			klog.V(4).Infof("Skip stale delayed action %s for Job<%s/%s>", delayAct.action, req.Namespace, req.JobName)
 			return
 		}
 
-		st := state.NewState(jobInfo)
-		if st == nil {
-			klog.Errorf("Invalid state <%s> of Job <%v/%v>",
-				jobInfo.Job.Status.State, jobInfo.Job.Namespace, jobInfo.Job.Name)
-			return
-		}
+		klog.V(4).Infof("Job<%s/%s>'s delayed action %s is expired, enqueue it", req.Namespace, req.JobName, delayAct.action)
+
+		actionReq := req
+		actionReq.Action = delayAct.action
 		queue := cc.getWorkerQueue(delayAct.jobKey)
-
-		if err := st.Execute(GetStateAction(delayAct)); err != nil {
-			cc.handleJobError(queue, req, st, err, delayAct.action)
-		}
-
-		queue.Forget(req)
-
-		cc.cleanupDelayActions(delayAct)
+		queue.Add(actionReq)
 	}()
+}
+
+// claimDelayAction atomically claims an expired delayed action and removes all
+// equivalent delayed actions in its scope. It prevents multiple pod timers in
+// one task or partition from executing the same action concurrently.
+func (cc *jobcontroller) claimDelayAction(currentDelayAction *delayAction) bool {
+	cc.delayActionMapLock.Lock()
+	defer cc.delayActionMapLock.Unlock()
+
+	m, exists := cc.delayActionMap[currentDelayAction.jobKey]
+	if !exists {
+		return false
+	}
+	registered, exists := m[currentDelayAction.podName]
+	if !exists || registered != currentDelayAction {
+		return false
+	}
+
+	cc.cleanupDelayActionsLocked(currentDelayAction)
+	return true
 }
 
 func (cc *jobcontroller) handleJobError(queue workqueue.TypedRateLimitingInterface[any], req apis.Request, st state.State, err error, action busv1alpha1.Action) {
@@ -542,31 +567,47 @@ func (cc *jobcontroller) handleJobError(queue workqueue.TypedRateLimitingInterfa
 func (cc *jobcontroller) cleanupDelayActions(currentDelayAction *delayAction) {
 	cc.delayActionMapLock.Lock()
 	defer cc.delayActionMapLock.Unlock()
+	cc.cleanupDelayActionsLocked(currentDelayAction)
+}
 
-	actionType := GetActionType(currentDelayAction.action)
+// cleanupDelayActionsLocked removes delayed actions equivalent to
+// currentDelayAction. The caller must hold delayActionMapLock.
+func (cc *jobcontroller) cleanupDelayActionsLocked(currentDelayAction *delayAction) {
+	m, exists := cc.delayActionMap[currentDelayAction.jobKey]
+	if !exists {
+		return
+	}
 
-	if m, exists := cc.delayActionMap[currentDelayAction.jobKey]; exists {
-		for _, delayAct := range m {
-			if GetActionType(delayAct.action) == actionType {
-				// For Task level actions, only cancel delayed actions for the same task
-				if actionType == TaskAction && delayAct.taskName != currentDelayAction.taskName {
-					continue
-				}
-				// For Pod level actions, only cancel delayed actions for the same pod
-				if actionType == PodAction && delayAct.podName != currentDelayAction.podName {
-					continue
-				}
-				// For partition group level actions, only cancel delayed actions for the same group
-				if actionType == PartitionAction && delayAct.partition != currentDelayAction.partition {
-					continue
-				}
-
-				if delayAct.cancel != nil {
-					klog.V(3).Infof("Cancel delayed action <%v> for pod <%s> because of event <%s> and action <%s> of Job <%s>", delayAct.action, delayAct.podName, currentDelayAction.event, currentDelayAction.action, delayAct.jobKey)
-					delayAct.cancel()
-				}
-				delete(m, delayAct.podName)
-			}
+	for podName, delayAct := range m {
+		if !sameDelayActionScope(currentDelayAction, delayAct) {
+			continue
 		}
+		if delayAct.cancel != nil {
+			klog.V(3).Infof("Cancel delayed action <%v> for pod <%s> because of event <%s> and action <%s> of Job <%s>", delayAct.action, delayAct.podName, currentDelayAction.event, currentDelayAction.action, delayAct.jobKey)
+			delayAct.cancel()
+		}
+		delete(m, podName)
+	}
+	if len(m) == 0 {
+		delete(cc.delayActionMap, currentDelayAction.jobKey)
+	}
+}
+
+func sameDelayActionScope(currentDelayAction, delayAct *delayAction) bool {
+	actionType := GetActionType(currentDelayAction.action)
+	if GetActionType(delayAct.action) != actionType {
+		return false
+	}
+
+	switch actionType {
+	case TaskAction:
+		return delayAct.taskName == currentDelayAction.taskName
+	case PodAction:
+		return delayAct.podName == currentDelayAction.podName
+	case PartitionAction:
+		return delayAct.taskName == currentDelayAction.taskName &&
+			delayAct.partition == currentDelayAction.partition
+	default:
+		return true
 	}
 }

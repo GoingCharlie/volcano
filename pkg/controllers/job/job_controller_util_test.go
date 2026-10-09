@@ -24,7 +24,10 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/uuid"
+	"k8s.io/client-go/util/workqueue"
+
 	"volcano.sh/apis/pkg/apis/batch/v1alpha1"
 	busv1alpha1 "volcano.sh/apis/pkg/apis/bus/v1alpha1"
 	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
@@ -522,6 +525,21 @@ func TestApplyPolicies(t *testing.T) {
 				Action: busv1alpha1.EnqueueAction,
 			},
 			ReturnVal: busv1alpha1.EnqueueAction,
+		},
+		{
+			Name: "Test delayed explicit action from an old job UID is ignored",
+			Job: &v1alpha1.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "job1",
+					Namespace: namespace,
+					UID:       "new-job-uid",
+				},
+			},
+			Request: &apis.Request{
+				JobUid: "old-job-uid",
+				Action: busv1alpha1.RestartPartitionAction,
+			},
+			ReturnVal: busv1alpha1.SyncJobAction,
 		},
 		{
 			Name: "Test Apply policies where event is OutOfSync",
@@ -1459,5 +1477,160 @@ func TestCalcPGMinResources(t *testing.T) {
 			t.Fatalf("case %d: expected %v got %v", i, tt.ExpectValue, gotMin)
 		}
 
+	}
+}
+
+func newDelayedActionTestController(t *testing.T) *jobcontroller {
+	t.Helper()
+
+	queue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[any]())
+	cc := &jobcontroller{
+		workers:        1,
+		queueList:      []workqueue.TypedRateLimitingInterface[any]{queue},
+		delayActionMap: make(map[string]map[string]*delayAction),
+	}
+	t.Cleanup(queue.ShutDown)
+	return cc
+}
+
+func waitForQueueLength(t *testing.T, queue workqueue.TypedRateLimitingInterface[any], want int) {
+	t.Helper()
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if queue.Len() == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("queue length = %d, want %d", queue.Len(), want)
+}
+
+func TestDelayedActionExpirationEnqueuesExplicitAction(t *testing.T) {
+	cc := newDelayedActionTestController(t)
+	req := apis.Request{
+		Namespace:   "default",
+		JobName:     "job",
+		JobUid:      "job-uid",
+		TaskName:    "worker",
+		PodName:     "worker-0",
+		PodUID:      "pod-uid",
+		PartitionID: "0",
+		Event:       busv1alpha1.PodPendingEvent,
+		JobVersion:  2,
+	}
+	delayAct := &delayAction{
+		jobKey:    "default/job",
+		taskName:  req.TaskName,
+		podName:   req.PodName,
+		podUID:    req.PodUID,
+		partition: req.PartitionID,
+		event:     req.Event,
+		action:    busv1alpha1.RestartPartitionAction,
+		delay:     time.Millisecond,
+	}
+
+	cc.AddDelayActionForJob(req, delayAct)
+	queue := cc.getWorkerQueue(delayAct.jobKey)
+	waitForQueueLength(t, queue, 1)
+
+	item, shutdown := queue.Get()
+	if shutdown {
+		t.Fatal("queue was shut down")
+	}
+	defer queue.Done(item)
+	got, ok := item.(apis.Request)
+	if !ok {
+		t.Fatalf("queued item has type %T, want apis.Request", item)
+	}
+	if got.Action != delayAct.action {
+		t.Fatalf("queued action = %q, want %q", got.Action, delayAct.action)
+	}
+	if got.JobUid != req.JobUid || got.PodUID != req.PodUID || got.JobVersion != req.JobVersion {
+		t.Fatalf("queued request lost identity fields: %#v", got)
+	}
+
+	cc.delayActionMapLock.RLock()
+	_, exists := cc.delayActionMap[delayAct.jobKey]
+	cc.delayActionMapLock.RUnlock()
+	if exists {
+		t.Fatalf("claimed delayed action for %q was not removed", delayAct.jobKey)
+	}
+}
+
+func TestDelayedPartitionActionsAreCoalescedByTaskAndPartition(t *testing.T) {
+	cc := newDelayedActionTestController(t)
+	queue := cc.getWorkerQueue("default/job")
+
+	for _, podName := range []string{"worker-0", "worker-1"} {
+		req := apis.Request{
+			Namespace:   "default",
+			JobName:     "job",
+			TaskName:    "worker",
+			PodName:     podName,
+			PodUID:      types.UID(podName + "-uid"),
+			PartitionID: "0",
+			Event:       busv1alpha1.PodPendingEvent,
+		}
+		cc.AddDelayActionForJob(req, &delayAction{
+			jobKey:    "default/job",
+			taskName:  req.TaskName,
+			podName:   req.PodName,
+			podUID:    req.PodUID,
+			partition: req.PartitionID,
+			event:     req.Event,
+			action:    busv1alpha1.RestartPartitionAction,
+			delay:     time.Millisecond,
+		})
+	}
+
+	waitForQueueLength(t, queue, 1)
+	time.Sleep(20 * time.Millisecond)
+	if got := queue.Len(); got != 1 {
+		t.Fatalf("queue length = %d, want one coalesced partition action", got)
+	}
+}
+
+func TestDelayedActionForRecreatedPodReplacesStaleTimer(t *testing.T) {
+	cc := newDelayedActionTestController(t)
+	queue := cc.getWorkerQueue("default/job")
+
+	add := func(uid string, delay time.Duration) {
+		req := apis.Request{
+			Namespace: "default",
+			JobName:   "job",
+			TaskName:  "worker",
+			PodName:   "worker-0",
+			PodUID:    types.UID(uid),
+			Event:     busv1alpha1.PodPendingEvent,
+		}
+		cc.AddDelayActionForJob(req, &delayAction{
+			jobKey:   "default/job",
+			taskName: req.TaskName,
+			podName:  req.PodName,
+			podUID:   req.PodUID,
+			event:    req.Event,
+			action:   busv1alpha1.RestartPodAction,
+			delay:    delay,
+		})
+	}
+
+	add("old-uid", 20*time.Millisecond)
+	add("new-uid", time.Millisecond)
+	waitForQueueLength(t, queue, 1)
+
+	item, shutdown := queue.Get()
+	if shutdown {
+		t.Fatal("queue was shut down")
+	}
+	defer queue.Done(item)
+	got := item.(apis.Request)
+	if got.PodUID != "new-uid" {
+		t.Fatalf("queued pod UID = %q, want replacement UID", got.PodUID)
+	}
+
+	time.Sleep(30 * time.Millisecond)
+	if got := queue.Len(); got != 0 {
+		t.Fatalf("stale timer enqueued %d additional actions", got)
 	}
 }

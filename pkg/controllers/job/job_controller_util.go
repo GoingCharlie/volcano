@@ -191,6 +191,17 @@ func applyPolicies(job *batch.Job, req *apis.Request) (delayAct *delayAction) {
 		action: v1alpha1.SyncJobAction,
 	}
 
+	// Solve the scenario: When pod events accumulate and vcjobs with the same name are frequently created,
+	// it is easy for the pod to cause abnormal status of the newly created vcjob with the same name.
+	if len(req.JobUid) != 0 && job != nil && req.JobUid != job.UID {
+		klog.V(2).Infof("The req belongs to job(%s/%s) and job uid is %v, but the uid of job(%s/%s) is %v in cache, perform %v action",
+			req.Namespace, req.JobName, req.JobUid, job.Namespace, job.Name, job.UID, v1alpha1.SyncJobAction)
+		return
+	}
+
+	// Explicit actions include delayed actions re-enqueued by the timer. Check
+	// the Job UID first so a timer from a deleted Job cannot act on a new Job
+	// with the same namespace and name.
 	if len(req.Action) != 0 {
 		delayAct.action = req.Action
 		return
@@ -198,14 +209,6 @@ func applyPolicies(job *batch.Job, req *apis.Request) (delayAct *delayAction) {
 
 	// If the event is an internal event, we do not need to perform any action
 	if isInternalEvent(req.Event) {
-		return
-	}
-
-	// Solve the scenario: When pod events accumulate and vcjobs with the same name are frequently created,
-	// it is easy for the pod to cause abnormal status of the newly created vcjob with the same name.
-	if len(req.JobUid) != 0 && job != nil && req.JobUid != job.UID {
-		klog.V(2).Infof("The req belongs to job(%s/%s) and job uid is %v, but the uid of job(%s/%s) is %v in cache, perform %v action",
-			req.Namespace, req.JobName, req.JobUid, job.Namespace, job.Name, job.UID, v1alpha1.SyncJobAction)
 		return
 	}
 
