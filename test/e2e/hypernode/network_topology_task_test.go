@@ -18,15 +18,19 @@ package hypernode
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/ptr"
 
 	batchv1alpha1 "volcano.sh/apis/pkg/apis/batch/v1alpha1"
+	busv1alpha1 "volcano.sh/apis/pkg/apis/bus/v1alpha1"
 	topologyv1alpha1 "volcano.sh/apis/pkg/apis/topology/v1alpha1"
 	e2eutil "volcano.sh/volcano/test/e2e/util"
 )
@@ -717,6 +721,198 @@ var _ = Describe("Network Topology Task Tests", func() {
 
 			By("Verify pods are pending")
 			Expect(e2eutil.WaitTaskPhase(ctx, topologyJob, []v1.PodPhase{v1.PodPending}, 2)).NotTo(HaveOccurred())
+		})
+
+		It("Case 5.7: RestartPartition moves the complete partition after one restarted pod remains pending", func() {
+			const restartPartitionTimeout = 20 * time.Second
+			sourceNodes := []string{"kwok-node-0", "kwok-node-1"}
+			targetNodes := []string{"kwok-node-2", "kwok-node-3"}
+
+			By("Block every tier-1 HyperNode except s0")
+			blockers := make(map[string]*v1.Pod)
+			for i := 2; i < 8; i++ {
+				nodeName := fmt.Sprintf("kwok-node-%d", i)
+				blockers[nodeName] = e2eutil.CreatePod(ctx, e2eutil.PodSpec{
+					Name:        fmt.Sprintf("case-5-7-blocker-%d", i),
+					Node:        nodeName,
+					Req:         e2eutil.CPU6Mem6,
+					Tolerations: tolerations,
+				})
+			}
+			defer func() {
+				for _, pod := range blockers {
+					e2eutil.DeletePod(ctx, pod)
+				}
+			}()
+			for _, pod := range blockers {
+				Expect(e2eutil.WaitPodReady(ctx, pod)).NotTo(HaveOccurred())
+			}
+
+			job := &e2eutil.JobSpec{
+				Name:     "job-5-7",
+				Min:      4,
+				MaxRetry: 5,
+				Policies: []batchv1alpha1.LifecyclePolicy{
+					{
+						Event:  busv1alpha1.PodFailedEvent,
+						Action: busv1alpha1.RestartPodAction,
+					},
+					{
+						Event:  busv1alpha1.PodPendingEvent,
+						Action: busv1alpha1.RestartPartitionAction,
+						Timeout: &metav1.Duration{
+							Duration: restartPartitionTimeout,
+						},
+					},
+				},
+				NetworkTopology: &batchv1alpha1.NetworkTopologySpec{
+					Mode:               batchv1alpha1.HardNetworkTopologyMode,
+					HighestTierAllowed: ptr.To(2),
+				},
+				Tasks: []e2eutil.TaskSpec{
+					{
+						Name:          "task-5-7",
+						Img:           e2eutil.DefaultNginxImage,
+						Req:           e2eutil.CPU3Mem3,
+						Min:           4,
+						Rep:           4,
+						RestartPolicy: v1.RestartPolicyNever,
+						Tolerations:   tolerations,
+						PartitionPolicy: &batchv1alpha1.PartitionPolicySpec{
+							TotalPartitions: 2,
+							PartitionSize:   2,
+							NetworkTopology: &batchv1alpha1.NetworkTopologySpec{
+								Mode:               batchv1alpha1.HardNetworkTopologyMode,
+								HighestTierAllowed: ptr.To(1),
+							},
+						},
+					},
+				},
+			}
+			topologyJob := e2eutil.CreateJob(ctx, job)
+			defer func() {
+				By("Delete job")
+				e2eutil.DeleteJob(ctx, topologyJob)
+			}()
+
+			By("Wait for all partitions to run in s0")
+			Expect(e2eutil.WaitJobReady(ctx, topologyJob)).NotTo(HaveOccurred())
+			Expect(e2eutil.VerifyPodScheduling(ctx, topologyJob, sourceNodes)).NotTo(HaveOccurred())
+
+			jobPods := e2eutil.GetTasksOfJob(ctx, topologyJob)
+			Expect(jobPods).To(HaveLen(4))
+			targetPartition := jobPods[0].Labels[batchv1alpha1.TaskPartitionID]
+			partitionPods := func() []*v1.Pod {
+				var result []*v1.Pod
+				for _, pod := range e2eutil.GetTasksOfJob(ctx, topologyJob) {
+					if pod.Labels[batchv1alpha1.TaskPartitionID] == targetPartition {
+						result = append(result, pod)
+					}
+				}
+				return result
+			}
+			originalPartitionPods := partitionPods()
+			Expect(originalPartitionPods).To(HaveLen(2))
+			originalUIDs := map[string]types.UID{
+				originalPartitionPods[0].Name: originalPartitionPods[0].UID,
+				originalPartitionPods[1].Name: originalPartitionPods[1].UID,
+			}
+			failedPodName := originalPartitionPods[0].Name
+			peerPodName := originalPartitionPods[1].Name
+
+			setSourceUnschedulable := func(unschedulable bool) {
+				patch := []byte(`{"spec":{"unschedulable":true}}`)
+				if !unschedulable {
+					patch = []byte(`{"spec":{"unschedulable":false}}`)
+				}
+				for _, nodeName := range sourceNodes {
+					_, err := ctx.Kubeclient.CoreV1().Nodes().Patch(
+						context.TODO(), nodeName, types.MergePatchType, patch, metav1.PatchOptions{})
+					Expect(err).NotTo(HaveOccurred(), "failed to update unschedulable state of node %s", nodeName)
+				}
+			}
+			defer setSourceUnschedulable(false)
+
+			By("Cordon s0 and fail one pod to trigger RestartPod")
+			setSourceUnschedulable(true)
+			err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				failedPod, getErr := ctx.Kubeclient.CoreV1().Pods(topologyJob.Namespace).Get(
+					context.TODO(), failedPodName, metav1.GetOptions{})
+				if getErr != nil {
+					return getErr
+				}
+				failedPod.Status.Phase = v1.PodFailed
+				failedPod.Status.Reason = "E2ERestartPartition"
+				failedPod.Status.ContainerStatuses = []v1.ContainerStatus{
+					{
+						Name: failedPod.Spec.Containers[0].Name,
+						State: v1.ContainerState{
+							Terminated: &v1.ContainerStateTerminated{ExitCode: 1},
+						},
+					},
+				}
+				_, updateErr := ctx.Kubeclient.CoreV1().Pods(topologyJob.Namespace).UpdateStatus(
+					context.TODO(), failedPod, metav1.UpdateOptions{})
+				return updateErr
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Wait for RestartPod to leave one replacement pending beside its running peer")
+			Eventually(func() bool {
+				current := partitionPods()
+				if len(current) != 2 {
+					return false
+				}
+				var replacementPending, originalPeerRunning bool
+				for _, pod := range current {
+					switch pod.Name {
+					case failedPodName:
+						replacementPending = pod.UID != originalUIDs[pod.Name] &&
+							pod.Status.Phase == v1.PodPending && pod.Spec.NodeName == ""
+					case peerPodName:
+						originalPeerRunning = pod.UID == originalUIDs[pod.Name] &&
+							pod.Status.Phase == v1.PodRunning
+					}
+				}
+				return replacementPending && originalPeerRunning
+			}, 12*time.Second, 200*time.Millisecond).Should(BeTrue())
+			restartedPod, err := ctx.Kubeclient.CoreV1().Pods(topologyJob.Namespace).Get(
+				context.TODO(), failedPodName, metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred())
+			prePartitionUIDs := map[string]types.UID{
+				failedPodName: restartedPod.UID,
+				peerPodName:   originalUIDs[peerPodName],
+			}
+
+			By("Release s1 while keeping s2 and s3 blocked")
+			for _, nodeName := range targetNodes {
+				e2eutil.DeletePod(ctx, blockers[nodeName])
+				delete(blockers, nodeName)
+			}
+
+			By("Verify the replacement remains pending until RestartPartition expires")
+			Consistently(func() bool {
+				pod, err := ctx.Kubeclient.CoreV1().Pods(topologyJob.Namespace).Get(
+					context.TODO(), failedPodName, metav1.GetOptions{})
+				return err == nil && pod.UID != originalUIDs[pod.Name] &&
+					pod.Status.Phase == v1.PodPending && pod.Spec.NodeName == ""
+			}, 2*time.Second, 200*time.Millisecond).Should(BeTrue())
+
+			By("Wait for RestartPartition to recreate both members on s1")
+			Expect(e2eutil.WaitJobReady(ctx, topologyJob)).NotTo(HaveOccurred())
+			Eventually(func() bool {
+				current := partitionPods()
+				if len(current) != 2 {
+					return false
+				}
+				for _, pod := range current {
+					if pod.UID == prePartitionUIDs[pod.Name] || pod.Status.Phase != v1.PodRunning ||
+						(pod.Spec.NodeName != targetNodes[0] && pod.Spec.NodeName != targetNodes[1]) {
+						return false
+					}
+				}
+				return true
+			}, e2eutil.FiveMinute, time.Second).Should(BeTrue())
 		})
 	})
 
