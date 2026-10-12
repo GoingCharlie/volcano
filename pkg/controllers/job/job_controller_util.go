@@ -181,7 +181,8 @@ func createJobPod(job *batch.Job, template *v1.PodTemplateSpec, ix int, jobForwa
 
 func applyPolicies(job *batch.Job, req *apis.Request) (delayAct *delayAction) {
 	delayAct = &delayAction{
-		jobKey:    jobcache.JobKeyByReq(req),
+		request:   *req,
+		job:       jobIdentity{key: jobcache.JobKeyByReq(req)},
 		event:     req.Event,
 		taskName:  req.TaskName,
 		podName:   req.PodName,
@@ -190,15 +191,9 @@ func applyPolicies(job *batch.Job, req *apis.Request) (delayAct *delayAction) {
 		// default action is sync job
 		action: v1alpha1.SyncJobAction,
 	}
-
-	if len(req.Action) != 0 {
-		delayAct.action = req.Action
-		return
-	}
-
-	// If the event is an internal event, we do not need to perform any action
-	if isInternalEvent(req.Event) {
-		return
+	if job != nil {
+		delayAct.job.uid = job.UID
+		delayAct.request.JobUid = job.UID
 	}
 
 	// Solve the scenario: When pod events accumulate and vcjobs with the same name are frequently created,
@@ -206,6 +201,19 @@ func applyPolicies(job *batch.Job, req *apis.Request) (delayAct *delayAction) {
 	if len(req.JobUid) != 0 && job != nil && req.JobUid != job.UID {
 		klog.V(2).Infof("The req belongs to job(%s/%s) and job uid is %v, but the uid of job(%s/%s) is %v in cache, perform %v action",
 			req.Namespace, req.JobName, req.JobUid, job.Namespace, job.Name, job.UID, v1alpha1.SyncJobAction)
+		return
+	}
+
+	// Explicit actions include retries of claimed delayed actions. Check the Job
+	// UID first so work from a deleted Job cannot act on a replacement Job with
+	// the same namespace and name.
+	if len(req.Action) != 0 {
+		delayAct.action = req.Action
+		return
+	}
+
+	// If the event is an internal event, we do not need to perform any action
+	if isInternalEvent(req.Event) {
 		return
 	}
 

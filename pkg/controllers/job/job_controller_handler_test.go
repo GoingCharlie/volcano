@@ -390,6 +390,27 @@ func TestAddPodFunc(t *testing.T) {
 	}
 }
 
+func TestPodAddedEventUsesObservedPhase(t *testing.T) {
+	tests := []struct {
+		name  string
+		phase v1.PodPhase
+		want  bus.Event
+	}{
+		{name: "pending", phase: v1.PodPending, want: bus.PodPendingEvent},
+		{name: "running", phase: v1.PodRunning, want: bus.PodRunningEvent},
+		{name: "failed is not replayed", phase: v1.PodFailed, want: bus.OutOfSyncEvent},
+		{name: "succeeded is not replayed", phase: v1.PodSucceeded, want: bus.OutOfSyncEvent},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pod := &v1.Pod{Status: v1.PodStatus{Phase: tt.phase}}
+			if got := podAddedEvent(pod); got != tt.want {
+				t.Fatalf("podAddedEvent(%q) = %q, want %q", tt.phase, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestUpdatePodFunc(t *testing.T) {
 	namespace := "test"
 

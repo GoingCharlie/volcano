@@ -134,6 +134,10 @@ func (cc *jobcontroller) deleteJob(obj interface{}) {
 		klog.Errorf("Failed to delete job <%s/%s>: %v in cache",
 			job.Namespace, job.Name, err)
 	}
+	cc.cleanupDelayActionsForJob(jobIdentity{
+		key: jobcache.JobKeyByName(job.Namespace, job.Name),
+		uid: job.UID,
+	})
 
 	// Delete job metrics
 	state.DeleteJobMetrics(fmt.Sprintf("%s/%s", job.Namespace, job.Name), job.Spec.Queue)
@@ -182,10 +186,7 @@ func (cc *jobcontroller) addPod(obj interface{}) {
 		return
 	}
 
-	event := bus.PodPendingEvent
-	if jobhelpers.IsOutOfSyncPod(pod) {
-		event = bus.OutOfSyncEvent
-	}
+	event := podAddedEvent(pod)
 
 	req := apis.Request{
 		Namespace:   pod.Namespace,
@@ -206,6 +207,24 @@ func (cc *jobcontroller) addPod(obj interface{}) {
 	key := jobhelpers.GetJobKeyByReq(&req)
 	queue := cc.getWorkerQueue(key)
 	queue.Add(req)
+}
+
+// podAddedEvent reflects the observed phase. Informer relists and controller
+// restarts can deliver Add for an already-running Pod; treating every Add as
+// Pending would create a false timeout policy.
+func podAddedEvent(pod *v1.Pod) bus.Event {
+	if jobhelpers.IsOutOfSyncPod(pod) {
+		return bus.OutOfSyncEvent
+	}
+	switch pod.Status.Phase {
+	case v1.PodPending, "":
+		return bus.PodPendingEvent
+	case v1.PodRunning:
+		return bus.PodRunningEvent
+	default:
+		// Do not replay historical Failed/Succeeded lifecycle policies on a relist.
+		return bus.OutOfSyncEvent
+	}
 }
 
 func (cc *jobcontroller) updatePod(oldObj, newObj interface{}) {

@@ -24,12 +24,16 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/uuid"
+	"k8s.io/client-go/util/workqueue"
+
 	"volcano.sh/apis/pkg/apis/batch/v1alpha1"
 	busv1alpha1 "volcano.sh/apis/pkg/apis/bus/v1alpha1"
 	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 
 	"volcano.sh/volcano/pkg/controllers/apis"
+	jobcache "volcano.sh/volcano/pkg/controllers/cache"
 )
 
 func TestMakePodName(t *testing.T) {
@@ -524,6 +528,21 @@ func TestApplyPolicies(t *testing.T) {
 			ReturnVal: busv1alpha1.EnqueueAction,
 		},
 		{
+			Name: "Test delayed explicit action from an old job UID is ignored",
+			Job: &v1alpha1.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "job1",
+					Namespace: namespace,
+					UID:       "new-job-uid",
+				},
+			},
+			Request: &apis.Request{
+				JobUid: "old-job-uid",
+				Action: busv1alpha1.RestartPartitionAction,
+			},
+			ReturnVal: busv1alpha1.SyncJobAction,
+		},
+		{
 			Name: "Test Apply policies where event is OutOfSync",
 			Job: &v1alpha1.Job{
 				ObjectMeta: metav1.ObjectMeta{
@@ -969,6 +988,42 @@ func TestApplyPolicies(t *testing.T) {
 				t.Errorf("Expected return value to be %s but got %s in case %d", testcase.ReturnVal, action.action, i)
 			}
 		})
+	}
+}
+
+func TestApplyPoliciesCapturesJobUIDForDelayedAction(t *testing.T) {
+	timeout := 30 * time.Second
+	job := &v1alpha1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "job",
+			Namespace: "default",
+			UID:       "job-uid",
+		},
+		Spec: v1alpha1.JobSpec{
+			Policies: []v1alpha1.LifecyclePolicy{
+				{
+					Event:  busv1alpha1.JobUnknownEvent,
+					Action: busv1alpha1.RestartJobAction,
+					Timeout: &metav1.Duration{
+						Duration: timeout,
+					},
+				},
+			},
+		},
+	}
+	req := &apis.Request{
+		Namespace: "default",
+		JobName:   "job",
+		Event:     busv1alpha1.JobUnknownEvent,
+	}
+
+	delayAct := applyPolicies(job, req)
+	if delayAct.job.uid != job.UID {
+		t.Fatalf("captured job UID = %q, want %q", delayAct.job.uid, job.UID)
+	}
+	if delayAct.action != busv1alpha1.RestartJobAction || delayAct.delay != timeout {
+		t.Fatalf("delayed action = %q after %v, want %q after %v",
+			delayAct.action, delayAct.delay, busv1alpha1.RestartJobAction, timeout)
 	}
 }
 
@@ -1459,5 +1514,232 @@ func TestCalcPGMinResources(t *testing.T) {
 			t.Fatalf("case %d: expected %v got %v", i, tt.ExpectValue, gotMin)
 		}
 
+	}
+}
+
+func newDelayedActionTestController(t *testing.T) *jobcontroller {
+	t.Helper()
+
+	queue := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[any]())
+	cc := &jobcontroller{
+		workers:        1,
+		queueList:      []workqueue.TypedRateLimitingInterface[any]{queue},
+		delayActionMap: make(map[jobIdentity]map[string]*delayAction),
+	}
+	t.Cleanup(queue.ShutDown)
+	return cc
+}
+
+func waitForQueueLength(t *testing.T, queue workqueue.TypedRateLimitingInterface[any], want int) {
+	t.Helper()
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if queue.Len() == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("queue length = %d, want %d", queue.Len(), want)
+}
+
+func newPendingDelayAction(req apis.Request, delay time.Duration) *delayAction {
+	return &delayAction{
+		job:       jobIdentity{key: jobcache.JobKeyByReq(&req), uid: req.JobUid},
+		taskName:  req.TaskName,
+		podName:   req.PodName,
+		podUID:    req.PodUID,
+		partition: req.PartitionID,
+		event:     busv1alpha1.PodPendingEvent,
+		action:    busv1alpha1.RestartPartitionAction,
+		delay:     delay,
+	}
+}
+
+func TestDelayedActionStaysRegisteredUntilWorkerClaims(t *testing.T) {
+	cc := newDelayedActionTestController(t)
+	req := apis.Request{
+		Namespace: "default", JobName: "job", JobUid: "job-uid",
+		TaskName: "worker", PodName: "worker-0", PodUID: "pod-uid",
+		PartitionID: "0", Event: busv1alpha1.PodPendingEvent, JobVersion: 2,
+	}
+	delayAct := newPendingDelayAction(req, time.Millisecond)
+	cc.scheduleDelayAction(req, delayAct)
+
+	queue := cc.getWorkerQueue(delayAct.job.key)
+	waitForQueueLength(t, queue, 1)
+	item, shutdown := queue.Get()
+	if shutdown {
+		t.Fatal("queue was shut down")
+	}
+	defer queue.Done(item)
+	if item != delayAct {
+		t.Fatalf("queued item = %T %p, want delayed token %p", item, item, delayAct)
+	}
+	if delayAct.request.JobUid != delayAct.job.uid || delayAct.request.Action != delayAct.action ||
+		delayAct.request.PodUID != req.PodUID || delayAct.request.JobVersion != req.JobVersion {
+		t.Fatalf("queued token lost request identity: %#v", delayAct.request)
+	}
+
+	cc.delayActionMapLock.RLock()
+	registered := cc.delayActionMap[delayAct.job][delayAct.podName]
+	cc.delayActionMapLock.RUnlock()
+	if registered != delayAct {
+		t.Fatal("delayed action was removed before the worker claimed it")
+	}
+	if !cc.claimDelayAction(delayAct) {
+		t.Fatal("worker could not claim current delayed action")
+	}
+	if cc.claimDelayAction(delayAct) {
+		t.Fatal("delayed action was claimable more than once")
+	}
+}
+
+func TestRunningEventCancelsReadyDelayedAction(t *testing.T) {
+	cc := newDelayedActionTestController(t)
+	req := apis.Request{
+		Namespace: "default", JobName: "job", JobUid: "job-uid",
+		TaskName: "worker", PodName: "worker-0", PodUID: "pod-uid",
+		PartitionID: "0", Event: busv1alpha1.PodPendingEvent,
+	}
+	delayAct := newPendingDelayAction(req, time.Millisecond)
+	cc.scheduleDelayAction(req, delayAct)
+	queue := cc.getWorkerQueue(delayAct.job.key)
+	waitForQueueLength(t, queue, 1)
+
+	runningReq := req
+	runningReq.Event = busv1alpha1.PodRunningEvent
+	cc.CleanPodDelayActionsIfNeed(runningReq)
+	if cc.claimDelayAction(delayAct) {
+		t.Fatal("ready delayed action remained claimable after Running event")
+	}
+}
+
+func TestPendingDelayedActionRevalidatesPod(t *testing.T) {
+	now := metav1.Now()
+	tests := []struct {
+		name      string
+		phase     v1.PodPhase
+		uid       types.UID
+		jobUID    types.UID
+		deleting  *metav1.Time
+		wantValid bool
+	}{
+		{name: "same pending pod", phase: v1.PodPending, uid: "pod-uid", wantValid: true},
+		{name: "pod is running", phase: v1.PodRunning, uid: "pod-uid"},
+		{name: "pod was recreated", phase: v1.PodPending, uid: "replacement-uid"},
+		{name: "pod is terminating", phase: v1.PodPending, uid: "pod-uid", deleting: &now},
+		{name: "job was recreated", phase: v1.PodPending, uid: "pod-uid", jobUID: "replacement-job-uid"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cc := newDelayedActionTestController(t)
+			req := apis.Request{
+				Namespace: "default", JobName: "job", JobUid: "job-uid",
+				TaskName: "worker", PodName: "worker-0", PodUID: "pod-uid",
+				PartitionID: "0", Event: busv1alpha1.PodPendingEvent,
+			}
+			delayAct := newPendingDelayAction(req, time.Hour)
+			cc.scheduleDelayAction(req, delayAct)
+			jobUID := req.JobUid
+			if tt.jobUID != "" {
+				jobUID = tt.jobUID
+			}
+			jobInfo := &apis.JobInfo{
+				Job: &v1alpha1.Job{ObjectMeta: metav1.ObjectMeta{
+					Namespace: req.Namespace, Name: req.JobName, UID: jobUID,
+				}},
+				Pods: map[string]map[string]*v1.Pod{
+					req.TaskName: {
+						req.PodName: {
+							ObjectMeta: metav1.ObjectMeta{Name: req.PodName, UID: tt.uid, DeletionTimestamp: tt.deleting},
+							Status:     v1.PodStatus{Phase: tt.phase},
+						},
+					},
+				},
+			}
+			if got := cc.delayActionCanExecute(delayAct, jobInfo); got != tt.wantValid {
+				t.Fatalf("delayActionCanExecute() = %v, want %v", got, tt.wantValid)
+			}
+		})
+	}
+}
+
+func TestDelayedPartitionActionsAreClaimedOnce(t *testing.T) {
+	cc := newDelayedActionTestController(t)
+	var actions []*delayAction
+	for _, podName := range []string{"worker-0", "worker-1"} {
+		req := apis.Request{
+			Namespace: "default", JobName: "job", JobUid: "job-uid",
+			TaskName: "worker", PodName: podName, PodUID: types.UID(podName + "-uid"),
+			PartitionID: "0", Event: busv1alpha1.PodPendingEvent,
+		}
+		delayAct := newPendingDelayAction(req, time.Millisecond)
+		actions = append(actions, delayAct)
+		cc.scheduleDelayAction(req, delayAct)
+	}
+
+	waitForQueueLength(t, cc.getWorkerQueue("default/job"), 2)
+	if !cc.claimDelayAction(actions[0]) {
+		t.Fatal("first partition token was not claimable")
+	}
+	if cc.claimDelayAction(actions[1]) {
+		t.Fatal("second token in the same partition was also claimable")
+	}
+}
+
+func TestDelayedActionForRecreatedPodReplacesGeneration(t *testing.T) {
+	cc := newDelayedActionTestController(t)
+	req := apis.Request{
+		Namespace: "default", JobName: "job", JobUid: "job-uid",
+		TaskName: "worker", PodName: "worker-0", PodUID: "old-uid",
+		Event: busv1alpha1.PodPendingEvent,
+	}
+	oldDelayAct := newPendingDelayAction(req, time.Millisecond)
+	cc.scheduleDelayAction(req, oldDelayAct)
+	req.PodUID = "new-uid"
+	newDelayAct := newPendingDelayAction(req, time.Hour)
+	cc.scheduleDelayAction(req, newDelayAct)
+	waitForQueueLength(t, cc.getWorkerQueue("default/job"), 1)
+
+	if cc.claimDelayAction(oldDelayAct) {
+		t.Fatal("replaced delayed generation was still claimable")
+	}
+	cc.delayActionMapLock.RLock()
+	registered := cc.delayActionMap[newDelayAct.job][newDelayAct.podName]
+	cc.delayActionMapLock.RUnlock()
+	if registered != newDelayAct {
+		t.Fatal("replacement generation is not registered")
+	}
+}
+
+func TestOldJobDelayedActionDoesNotAffectReplacementJob(t *testing.T) {
+	cc := newDelayedActionTestController(t)
+	oldReq := apis.Request{
+		Namespace: "default", JobName: "job", JobUid: "old-job-uid",
+		TaskName: "worker", PodName: "worker-0", PodUID: "old-pod-uid",
+		PartitionID: "0", Event: busv1alpha1.PodPendingEvent,
+	}
+	newReq := oldReq
+	newReq.JobUid = "new-job-uid"
+	newReq.PodUID = "new-pod-uid"
+	oldDelayAct := newPendingDelayAction(oldReq, time.Hour)
+	newDelayAct := newPendingDelayAction(newReq, time.Hour)
+	cc.scheduleDelayAction(oldReq, oldDelayAct)
+	cc.scheduleDelayAction(newReq, newDelayAct)
+
+	if !cc.claimDelayAction(oldDelayAct) {
+		t.Fatal("old Job token could not be claimed independently")
+	}
+	cc.delayActionMapLock.RLock()
+	registered := cc.delayActionMap[newDelayAct.job][newDelayAct.podName]
+	cc.delayActionMapLock.RUnlock()
+	if registered != newDelayAct {
+		t.Fatal("old Job token removed replacement Job action")
+	}
+
+	cc.cleanupDelayActionsForJob(newDelayAct.job)
+	if cc.claimDelayAction(newDelayAct) {
+		t.Fatal("deleted Job action remained claimable")
 	}
 }
