@@ -179,7 +179,7 @@ func (cc *jobcontroller) killPods(jobInfo *apis.JobInfo, podRetainPhase state.Ph
 
 	for podName, pod := range podsToKill {
 		_, err := cc.kubeClient.CoreV1().Pods(pod.Namespace).Patch(context.TODO(), pod.Name, types.JSONPatchType,
-			jobhelpers.OutOfSyncJSONPatch(), metav1.PatchOptions{})
+			jobhelpers.OutOfSyncJSONPatch(pod.UID), metav1.PatchOptions{})
 		if err != nil && !apierrors.IsNotFound(err) {
 			// record the error, and then collect the pod info like retained pod
 			errs = append(errs, err)
@@ -909,7 +909,10 @@ func (cc *jobcontroller) shouldUpdateExistingPodGroup(pg *scheduling.PodGroup, j
 }
 
 func (cc *jobcontroller) deleteJobPod(jobName string, pod *v1.Pod) error {
-	err := cc.kubeClient.CoreV1().Pods(pod.Namespace).Delete(context.TODO(), pod.Name, metav1.DeleteOptions{})
+	uid := pod.UID
+	err := cc.kubeClient.CoreV1().Pods(pod.Namespace).Delete(context.TODO(), pod.Name, metav1.DeleteOptions{
+		Preconditions: &metav1.Preconditions{UID: &uid},
+	})
 	if err != nil && !apierrors.IsNotFound(err) {
 		klog.Errorf("Failed to delete pod %s/%s for Job %s, err %#v",
 			pod.Namespace, pod.Name, jobName, err)
