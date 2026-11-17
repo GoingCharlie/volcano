@@ -18,7 +18,6 @@ package podgroup
 
 import (
 	"context"
-	"fmt"
 	"reflect"
 	"testing"
 
@@ -60,6 +59,7 @@ func newFakeController() *pgcontroller {
 		VCSharedInformerFactory: vcSharedInformers,
 		SchedulerNames:          []string{"volcano"},
 		InheritOwnerAnnotations: true,
+		WorkerThreadsForPG:      1,
 	}
 
 	controller.Initialize(opt)
@@ -375,6 +375,10 @@ func TestAddStatefulSet(t *testing.T) {
 	volcanoSchedulerPod.Spec.SchedulerName = "volcano"
 	existedPodWithPG := util.BuildPod(namespace, podName, "", v1.PodPending, api.BuildResourceList("1", "2Gi"), "lws-1-revision", map[string]string{"app": stsName}, nil)
 	existedPodWithPG.Spec.SchedulerName = "volcano"
+	ownerUID := types.UID("sts-test-uid")
+	for _, pod := range []*v1.Pod{defaultSchedulerPod, volcanoSchedulerPod, existedPodWithPG} {
+		pod.OwnerReferences = []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "StatefulSet", Name: stsName, UID: ownerUID, Controller: ptr.To(true)}}
+	}
 
 	testCases := []struct {
 		name            string
@@ -438,7 +442,7 @@ func TestAddStatefulSet(t *testing.T) {
 			expectPGCreated: true,
 			expectPG: &scheduling.PodGroup{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:            vcbatch.PodgroupNamePrefix + fmt.Sprintf("%s-%s", namespace, podName),
+					Name:            vcbatch.PodgroupNamePrefix + string(ownerUID),
 					Namespace:       namespace,
 					OwnerReferences: newPGOwnerReferences(volcanoSchedulerPod),
 					Labels:          map[string]string{},
@@ -482,8 +486,12 @@ func TestAddStatefulSet(t *testing.T) {
 				c.podInformer.Informer().GetIndexer().Add(pod)
 			}
 
+			testCase.sts.UID = ownerUID
+			_, err := c.kubeClient.AppsV1().StatefulSets(namespace).Create(context.TODO(), testCase.sts, metav1.CreateOptions{})
+			assert.NoError(t, err)
 			c.addStatefulSet(testCase.sts)
-			expectedPGName := vcbatch.PodgroupNamePrefix + fmt.Sprintf("%s-%s", namespace, podName)
+			c.processNextWorkload()
+			expectedPGName := vcbatch.PodgroupNamePrefix + string(ownerUID)
 			pg, err := c.vcClient.SchedulingV1beta1().PodGroups("test").Get(context.TODO(), expectedPGName, metav1.GetOptions{})
 			if testCase.expectPGCreated {
 				assert.NoError(t, err)
@@ -1335,6 +1343,7 @@ func TestNoPodGroupCreatedForWhenKubeGroupNameAnnotationExists(t *testing.T) {
 		c.addPod(pod)
 		c.processNextReq()
 		c.updateReplicaSet(rs, rs)
+		c.processNextWorkload()
 		pgList, err := c.vcClient.SchedulingV1beta1().PodGroups(namespace).List(context.TODO(), metav1.ListOptions{})
 		assert.NoError(t, err)
 		names := make([]string, 0, len(pgList.Items))
@@ -1406,6 +1415,7 @@ func TestNoPodGroupCreatedForWhenKubeGroupNameAnnotationExists(t *testing.T) {
 		c.addPod(pod)
 		c.processNextReq()
 		c.updateStatefulSet(sts, sts)
+		c.processNextWorkload()
 		pgList, err := c.vcClient.SchedulingV1beta1().PodGroups(namespace).List(context.TODO(), metav1.ListOptions{})
 		assert.NoError(t, err)
 		names := make([]string, 0, len(pgList.Items))

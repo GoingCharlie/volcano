@@ -230,7 +230,7 @@ func TestRecreatedPodIsBoundToNewOwnerPodGroup(t *testing.T) {
 
 			assert.NoError(t, c.podInformer.Informer().GetIndexer().Add(newPod.DeepCopy()))
 			c.processNextReq()
-			assert.Equal(t, 1, c.queue.NumRequeues(oldReq))
+			assert.Equal(t, 0, c.queue.NumRequeues(oldReq))
 
 			c.addPod(newPod)
 			c.processNextReq()
@@ -267,10 +267,13 @@ func TestAddStatefulSetWithRecreatedPod(t *testing.T) {
 	_, err := c.kubeClient.CoreV1().Pods(newPod.Namespace).Create(context.TODO(), newPod.DeepCopy(), metav1.CreateOptions{})
 	assert.NoError(t, err)
 
+	_, err = c.kubeClient.AppsV1().StatefulSets(sts.Namespace).Create(context.TODO(), sts, metav1.CreateOptions{})
+	assert.NoError(t, err)
 	c.addStatefulSet(sts)
+	c.processNextWorkload()
 	pod, err := c.kubeClient.CoreV1().Pods(newPod.Namespace).Get(context.TODO(), newPod.Name, metav1.GetOptions{})
 	assert.NoError(t, err)
-	assert.Empty(t, pod.Annotations[scheduling.KubeGroupNameAnnotationKey])
+	assert.Equal(t, vcbatch.PodgroupNamePrefix+string(sts.UID), pod.Annotations[scheduling.KubeGroupNameAnnotationKey])
 
 	assert.NoError(t, c.podInformer.Informer().GetIndexer().Add(newPod.DeepCopy()))
 	c.addPod(newPod)
