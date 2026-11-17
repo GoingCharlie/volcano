@@ -82,6 +82,7 @@ func TestAddPodGroup(t *testing.T) {
 	}{
 		{
 			name: "AddPodGroup: pod has ownerReferences and priorityClassName",
+			rs:   &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: "rs1", Namespace: namespace, UID: "7a09885b-b753-4924-9fba-77c0836bac20"}},
 			pods: []*v1.Pod{
 				{
 					TypeMeta: metav1.TypeMeta{
@@ -324,7 +325,7 @@ func TestAddPodGroup(t *testing.T) {
 			}
 
 			c.addPod(pod)
-			c.createNormalPodPGIfNotExist(pod)
+			c.createNormalPodPGIfNotExist(pod, nil)
 
 			pg, err := c.vcClient.SchedulingV1beta1().PodGroups(pod.Namespace).Get(context.TODO(),
 				testCase.expectedPodGroup.Name,
@@ -624,7 +625,7 @@ func Test_createOrUpdateNormalPodPG(t *testing.T) {
 		c.vcInformerFactory.Start(context.TODO().Done())
 		cache.WaitForNamedCacheSync("", context.TODO().Done(), c.vcInformerFactory.Scheduling().V1beta1().PodGroups().Informer().HasSynced)
 
-		c.createOrUpdateNormalPodPG(pod)
+		c.createOrUpdateNormalPodPG(pod, nil)
 		pg, err := c.vcClient.SchedulingV1beta1().PodGroups(pod.Namespace).Get(context.TODO(), "podgroup-7a09885b-b753-4924-9fba-77c0836bac20", metav1.GetOptions{})
 		if err != nil {
 			t.Errorf("Case 1 failed when getting podGroup for %v", err)
@@ -794,7 +795,7 @@ func Test_createOrUpdateNormalPodPG(t *testing.T) {
 		c.vcInformerFactory.Start(context.TODO().Done())
 		cache.WaitForNamedCacheSync("", context.TODO().Done(), c.vcInformerFactory.Scheduling().V1beta1().PodGroups().Informer().HasSynced)
 
-		c.createOrUpdateNormalPodPG(pod)
+		c.createOrUpdateNormalPodPG(pod, nil)
 		pg, err := c.vcClient.SchedulingV1beta1().PodGroups(pod.Namespace).Get(context.TODO(), "podgroup-7a09885b-b753-4924-9fba-77c0836bac20", metav1.GetOptions{})
 		if err != nil {
 			t.Errorf("Case 2 failed when getting podGroup for %v", err)
@@ -861,7 +862,7 @@ func Test_pgcontroller_buildPodGroupFromPod(t *testing.T) {
 		}
 
 		// Execute test function
-		resultPG := c.buildPodGroupFromPod(pod, pgName)
+		resultPG := c.buildPodGroupFromPod(pod, pgName, nil)
 
 		// Verify basic fields
 		if resultPG == nil {
@@ -972,7 +973,7 @@ func Test_pgcontroller_buildPodGroupFromPod(t *testing.T) {
 		}
 
 		// Execute test function
-		resultPG := c.buildPodGroupFromPod(pod, pgName)
+		resultPG := c.buildPodGroupFromPod(pod, pgName, rs.Annotations)
 
 		// Verify inherited annotations and MinMember
 		if resultPG.Spec.MinMember != 3 {
@@ -1052,7 +1053,7 @@ func Test_pgcontroller_buildPodGroupFromPod(t *testing.T) {
 		}
 
 		// Execute test function
-		resultPG := c.buildPodGroupFromPod(pod, pgName)
+		resultPG := c.buildPodGroupFromPod(pod, pgName, rs.Annotations)
 
 		// Verify JDBMaxUnavailable is inherited
 		if resultPG.Annotations[scheduling.JDBMaxUnavailable] != "20%" {
@@ -1104,25 +1105,25 @@ func Test_pgcontroller_updateExistingPodGroup(t *testing.T) {
 		}
 
 		// Execute test function
-		currentPG := c.buildPodGroupFromPod(pod, pgName)
+		currentPG := c.buildPodGroupFromPod(pod, pgName, nil)
 
 		// Spec changed
 		currentPG.Spec.MinMember = 2
-		isUpdated := c.shouldUpdateExistingPodGroup(currentPG, pod)
+		isUpdated := c.shouldUpdateExistingPodGroup(currentPG, c.buildPodGroupFromPod(pod, pgName, nil))
 		if !isUpdated {
 			t.Error("expected isUpdated true, got false")
 		}
 
 		// Labels changed
 		currentPG.Labels[scheduling.CooldownTime] = "120s"
-		isUpdated = c.shouldUpdateExistingPodGroup(currentPG, pod)
+		isUpdated = c.shouldUpdateExistingPodGroup(currentPG, c.buildPodGroupFromPod(pod, pgName, nil))
 		if !isUpdated {
 			t.Error("expected isUpdated true, got false")
 		}
 
 		// Annotations changed
 		currentPG.Annotations[scheduling.PodPreemptable] = "false"
-		isUpdated = c.shouldUpdateExistingPodGroup(currentPG, pod)
+		isUpdated = c.shouldUpdateExistingPodGroup(currentPG, c.buildPodGroupFromPod(pod, pgName, nil))
 		if !isUpdated {
 			t.Error("expected isUpdated true, got false")
 		}
@@ -1260,7 +1261,7 @@ func TestBuildPodGroupFromPodWithNetworkTopology(t *testing.T) {
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
 			pgName := "test-podgroup"
-			podGroup := controller.buildPodGroupFromPod(testCase.pod, pgName)
+			podGroup := controller.buildPodGroupFromPod(testCase.pod, pgName, nil)
 
 			assert.NotNil(t, podGroup)
 			assert.Equal(t, pgName, podGroup.Name)

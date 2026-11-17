@@ -133,52 +133,49 @@ func (pg *pgcontroller) updatePodAnnotations(pod *v1.Pod, pgName string) error {
 	return nil
 }
 
-func (pg *pgcontroller) getAnnotationsFromUpperRes(pod *v1.Pod) map[string]string {
-	var annotations = make(map[string]string)
-
+// Resolve annotations before building a spec. A failed read must not be
+// mistaken for a successfully read owner with no scheduling annotations.
+// knownOwner is the workload snapshot already fetched and UID-checked by syncWorkload.
+func (pg *pgcontroller) getAnnotationsFromUpperRes(pod *v1.Pod, knownOwner metav1.Object) (map[string]string, error) {
+	annotations := make(map[string]string)
+	if !pg.inheritOwnerAnnotations {
+		return annotations, nil
+	}
 	for _, reference := range pod.OwnerReferences {
-		if reference.Kind != "" && reference.Name != "" {
-			tmp := make(map[string]string)
+		if reference.Kind == "" || reference.Name == "" {
+			continue
+		}
+		var owner metav1.Object
+		var err error
+		if knownOwner != nil && reference.UID == knownOwner.GetUID() && reference.Name == knownOwner.GetName() {
+			owner = knownOwner
+		} else {
 			switch reference.Kind {
 			case "ReplicaSet":
-				rs, err := pg.kubeClient.AppsV1().ReplicaSets(pod.Namespace).Get(context.TODO(), reference.Name, metav1.GetOptions{})
-				if err != nil {
-					klog.Errorf("Failed to get upper %s for Pod <%s/%s>: %v", reference.Kind, pod.Namespace, reference.Name, err)
-					continue
-				}
-				tmp = rs.Annotations
+				owner, err = pg.kubeClient.AppsV1().ReplicaSets(pod.Namespace).Get(context.TODO(), reference.Name, metav1.GetOptions{})
 			case "DaemonSet":
-				ds, err := pg.kubeClient.AppsV1().DaemonSets(pod.Namespace).Get(context.TODO(), reference.Name, metav1.GetOptions{})
-				if err != nil {
-					klog.Errorf("Failed to get upper %s for Pod <%s/%s>: %v", reference.Kind, pod.Namespace, reference.Name, err)
-					continue
-				}
-				tmp = ds.Annotations
+				owner, err = pg.kubeClient.AppsV1().DaemonSets(pod.Namespace).Get(context.TODO(), reference.Name, metav1.GetOptions{})
 			case "StatefulSet":
-				ss, err := pg.kubeClient.AppsV1().StatefulSets(pod.Namespace).Get(context.TODO(), reference.Name, metav1.GetOptions{})
-				if err != nil {
-					klog.Errorf("Failed to get upper %s for Pod <%s/%s>: %v", reference.Kind, pod.Namespace, reference.Name, err)
-					continue
-				}
-				tmp = ss.Annotations
+				owner, err = pg.kubeClient.AppsV1().StatefulSets(pod.Namespace).Get(context.TODO(), reference.Name, metav1.GetOptions{})
 			case "Job":
-				job, err := pg.kubeClient.BatchV1().Jobs(pod.Namespace).Get(context.TODO(), reference.Name, metav1.GetOptions{})
-				if err != nil {
-					klog.Errorf("Failed to get upper %s for Pod <%s/%s>: %v", reference.Kind, pod.Namespace, reference.Name, err)
-					continue
-				}
-				tmp = job.Annotations
+				owner, err = pg.kubeClient.BatchV1().Jobs(pod.Namespace).Get(context.TODO(), reference.Name, metav1.GetOptions{})
+			default:
+				continue
 			}
-
-			for k, v := range tmp {
-				if _, ok := annotations[k]; !ok {
-					annotations[k] = v
-				}
+		}
+		if err != nil {
+			return nil, fmt.Errorf("get %s %s/%s for Pod %s: %w", reference.Kind, pod.Namespace, reference.Name, pod.Name, err)
+		}
+		if owner.GetUID() != reference.UID {
+			return nil, fmt.Errorf("%s %s/%s UID does not match Pod %s owner reference", reference.Kind, pod.Namespace, reference.Name, pod.Name)
+		}
+		for k, v := range owner.GetAnnotations() {
+			if _, ok := annotations[k]; !ok {
+				annotations[k] = v
 			}
 		}
 	}
-
-	return annotations
+	return annotations, nil
 }
 
 func (pg *pgcontroller) getMinMemberFromUpperRes(upperAnnotations map[string]string, namespance, name string) int32 {
@@ -214,10 +211,11 @@ func (pg *pgcontroller) inheritUpperAnnotations(upperAnnotations map[string]stri
 
 // ensureNormalPodGroup also validates objects returned after an AlreadyExists
 // response: informer caches can lag behind a delete or concurrent creation.
-func (pg *pgcontroller) ensureNormalPodGroup(pod *v1.Pod, pgName string) (*scheduling.PodGroup, error) {
+func (pg *pgcontroller) ensureNormalPodGroup(pod *v1.Pod, desired *scheduling.PodGroup) (*scheduling.PodGroup, error) {
+	pgName := desired.Name
 	group, err := pg.pgLister.PodGroups(pod.Namespace).Get(pgName)
 	if apierrors.IsNotFound(err) {
-		group, err = pg.vcClient.SchedulingV1beta1().PodGroups(pod.Namespace).Create(context.TODO(), pg.buildPodGroupFromPod(pod, pgName), metav1.CreateOptions{})
+		group, err = pg.vcClient.SchedulingV1beta1().PodGroups(pod.Namespace).Create(context.TODO(), desired, metav1.CreateOptions{})
 		if apierrors.IsAlreadyExists(err) {
 			group, err = pg.vcClient.SchedulingV1beta1().PodGroups(pod.Namespace).Get(context.TODO(), pgName, metav1.GetOptions{})
 		} else if err == nil {
@@ -240,9 +238,14 @@ func (pg *pgcontroller) ensureNormalPodGroup(pod *v1.Pod, pgName string) (*sched
 	return nil, fmt.Errorf("PodGroup %s/%s has an unexpected controller owner", pod.Namespace, pgName)
 }
 
-func (pg *pgcontroller) createNormalPodPGIfNotExist(pod *v1.Pod) error {
+func (pg *pgcontroller) createNormalPodPGIfNotExist(pod *v1.Pod, owner metav1.Object) error {
+	annotations, err := pg.getAnnotationsFromUpperRes(pod, owner)
+	if err != nil {
+		return err
+	}
 	pgName := helpers.GeneratePodgroupName(pod)
-	if _, err := pg.ensureNormalPodGroup(pod, pgName); err != nil {
+	desired := pg.buildPodGroupFromPod(pod, pgName, annotations)
+	if _, err := pg.ensureNormalPodGroup(pod, desired); err != nil {
 		return err
 	}
 	return pg.updatePodAnnotations(pod, pgName)
@@ -250,14 +253,19 @@ func (pg *pgcontroller) createNormalPodPGIfNotExist(pod *v1.Pod) error {
 
 // Workload changes can update group requirements even when pods already have
 // their automatically generated group-name annotation.
-func (pg *pgcontroller) createOrUpdateNormalPodPG(pod *v1.Pod) error {
+func (pg *pgcontroller) createOrUpdateNormalPodPG(pod *v1.Pod, owner metav1.Object) error {
+	annotations, err := pg.getAnnotationsFromUpperRes(pod, owner)
+	if err != nil {
+		return err
+	}
 	pgName := helpers.GeneratePodgroupName(pod)
-	group, err := pg.ensureNormalPodGroup(pod, pgName)
+	desired := pg.buildPodGroupFromPod(pod, pgName, annotations)
+	group, err := pg.ensureNormalPodGroup(pod, desired)
 	if err != nil {
 		return err
 	}
 	updated := group.DeepCopy()
-	if pg.shouldUpdateExistingPodGroup(updated, pod) {
+	if pg.shouldUpdateExistingPodGroup(updated, desired) {
 		if _, err := pg.vcClient.SchedulingV1beta1().PodGroups(pod.Namespace).Update(context.TODO(), updated, metav1.UpdateOptions{}); err != nil {
 			return err
 		}
@@ -266,11 +274,10 @@ func (pg *pgcontroller) createOrUpdateNormalPodPG(pod *v1.Pod) error {
 	return pg.updatePodAnnotations(pod, pgName)
 }
 
-func (pg *pgcontroller) buildPodGroupFromPod(pod *v1.Pod, pgName string) *scheduling.PodGroup {
+// buildPodGroupFromPod uses already-resolved annotations and never reads the API.
+func (pg *pgcontroller) buildPodGroupFromPod(pod *v1.Pod, pgName string, ownerAnnotations map[string]string) *scheduling.PodGroup {
 	var minMember = int32(1)
-	var ownerAnnotations = make(map[string]string)
 	if pg.inheritOwnerAnnotations {
-		ownerAnnotations = pg.getAnnotationsFromUpperRes(pod)
 		minMember = pg.getMinMemberFromUpperRes(ownerAnnotations, pod.Namespace, pod.Name)
 	}
 	minResources := util.CalTaskRequests(pod, minMember)
@@ -376,10 +383,8 @@ func parseNetworkTopologyFromPod(pod *v1.Pod) *scheduling.NetworkTopologySpec {
 	return nt
 }
 
-func (pg *pgcontroller) shouldUpdateExistingPodGroup(podGroup *scheduling.PodGroup, pod *v1.Pod) bool {
+func (pg *pgcontroller) shouldUpdateExistingPodGroup(podGroup, newPodGroup *scheduling.PodGroup) bool {
 	isUpdated := false
-
-	newPodGroup := pg.buildPodGroupFromPod(pod, podGroup.Name)
 	// Admission resolves an unspecified queue from the namespace on CREATE
 	// only. Preserve that resolved queue when reconciling other requirements.
 	if newPodGroup.Spec.Queue == "" {

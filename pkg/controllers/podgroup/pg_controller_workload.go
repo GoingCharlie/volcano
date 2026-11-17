@@ -141,7 +141,7 @@ func (pg *pgcontroller) syncWorkload(req workloadRequest) error {
 			fallback = pod
 			continue
 		}
-		return pg.createOrUpdateNormalPodPG(pod)
+		return pg.createOrUpdateNormalPodPG(pod, owner)
 	}
 	if replicas == 0 {
 		return pg.deleteWorkloadPodGroup(owner)
@@ -150,7 +150,7 @@ func (pg *pgcontroller) syncWorkload(req workloadRequest) error {
 	// Keep existing members schedulable without overwriting group requirements
 	// from an older revision when the group already exists.
 	if fallback != nil {
-		return pg.createNormalPodPGIfNotExist(fallback)
+		return pg.createNormalPodPGIfNotExist(fallback, owner)
 	}
 	return nil
 }

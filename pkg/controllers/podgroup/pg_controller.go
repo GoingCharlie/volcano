@@ -201,5 +201,5 @@ func (pg *pgcontroller) syncPod(req podRequest) error {
 
 	// normal pod use volcano
 	klog.V(4).Infof("Try to create podgroup for pod %s/%s", pod.Namespace, pod.Name)
-	return pg.createNormalPodPGIfNotExist(pod)
+	return pg.createNormalPodPGIfNotExist(pod, nil)
 }

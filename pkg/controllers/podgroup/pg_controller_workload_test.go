@@ -19,6 +19,7 @@ package podgroup
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -143,7 +144,7 @@ func TestSyncWorkload(t *testing.T) {
 					}
 					name := helpers.GeneratePodgroupName(pod)
 					if !tt.missingGroup {
-						group := c.buildPodGroupFromPod(pod, name).DeepCopy()
+						group := c.buildPodGroupFromPod(pod, name, nil).DeepCopy()
 						group.UID, group.ResourceVersion = "group-uid", "1"
 						if tt.foreignOwner {
 							group.OwnerReferences[0].UID = "foreign-workload-uid"
@@ -276,7 +277,7 @@ func TestSyncWorkloadQueue(t *testing.T) {
 					})
 					name := helpers.GeneratePodgroupName(pod)
 					if tt.existingGroup {
-						group := c.buildPodGroupFromPod(pod, name)
+						group := c.buildPodGroupFromPod(pod, name, nil)
 						// The workload now requests minMember=2; the existing group
 						// still has its previous requirement and admitted queue.
 						group.Spec.MinMember = 1
@@ -297,6 +298,184 @@ func TestSyncWorkloadQueue(t *testing.T) {
 					assert.EqualValues(t, 2, group.Spec.MinMember)
 				})
 			}
+		})
+	}
+}
+
+func TestSyncWorkloadOwnerAnnotations(t *testing.T) {
+	tests := []struct {
+		name          string
+		missingGroup  bool
+		uncachedGroup bool
+		oldRevision   bool
+		minMember     string
+		wantMinMember int32
+	}{
+		{name: "existing group retains gang requirements", minMember: "3", wantMinMember: 3},
+		{name: "new group uses the verified owner snapshot", missingGroup: true, minMember: "3", wantMinMember: 3},
+		{name: "uncached existing group uses the verified snapshot", uncachedGroup: true, minMember: "3", wantMinMember: 3},
+		{name: "older revision can recover with verified annotations", missingGroup: true, oldRevision: true, minMember: "3", wantMinMember: 3},
+		{name: "successful config change can lower gang requirements", minMember: "2", wantMinMember: 2},
+		{name: "verified absence of annotation uses the default", wantMinMember: 1},
+	}
+	for _, kind := range []string{"ReplicaSet", "StatefulSet"} {
+		t.Run(kind, func(t *testing.T) {
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					ctx := context.Background()
+					c := newFakeController()
+					t.Cleanup(c.queue.ShutDown)
+					t.Cleanup(c.workloadQueue.ShutDown)
+					obj, pod := rolloutObjects(kind, 3)
+					annotations := map[string]string{scheduling.PodPreemptable: "false"}
+					if tt.minMember != "" {
+						annotations[scheduling.VolcanoGroupMinMemberAnnotationKey] = tt.minMember
+					}
+					obj.(metav1.Object).SetAnnotations(annotations)
+					storeRolloutWorkload(t, c, obj)
+					if tt.oldRevision {
+						pod.Labels[controllerRevisionHashLabelKey] = "old-revision"
+					}
+					_, err := c.kubeClient.CoreV1().Pods(pod.Namespace).Create(ctx, pod, metav1.CreateOptions{})
+					require.NoError(t, err)
+					name := helpers.GeneratePodgroupName(pod)
+					if !tt.missingGroup {
+						group := c.buildPodGroupFromPod(pod, name, annotations)
+						group.Spec.MinMember = 3
+						_, err = c.vcClient.SchedulingV1beta1().PodGroups(pod.Namespace).Create(ctx, group, metav1.CreateOptions{})
+						require.NoError(t, err)
+						if !tt.uncachedGroup {
+							require.NoError(t, c.pgInformer.Informer().GetIndexer().Add(group.DeepCopy()))
+						}
+					}
+					reads := 0
+					c.kubeClient.(*kubeclient.Clientset).PrependReactor("get", strings.ToLower(kind)+"s", func(k8stesting.Action) (bool, runtime.Object, error) {
+						reads++
+						if reads > 1 {
+							return true, nil, apierrors.NewServiceUnavailable("owner read failed after initial reconciliation GET")
+						}
+						return false, nil, nil
+					})
+					enqueueRolloutWorkload(c, obj)
+					require.True(t, c.processNextWorkload())
+					group, err := c.vcClient.SchedulingV1beta1().PodGroups(pod.Namespace).Get(ctx, name, metav1.GetOptions{})
+					require.NoError(t, err)
+					assert.Equal(t, tt.wantMinMember, group.Spec.MinMember)
+					assert.Equal(t, "false", group.Annotations[scheduling.PodPreemptable])
+					assert.Equal(t, 1, reads, "reuse the verified owner instead of issuing a second GET")
+					req := workloadRequest{kind: kind, namespace: pod.Namespace, name: "workload", uid: "workload-uid"}
+					assert.Zero(t, c.workloadQueue.NumRequeues(req))
+				})
+			}
+		})
+	}
+}
+
+func TestProcessNextReqOwnerReadFailure(t *testing.T) {
+	for _, kind := range []string{"ReplicaSet", "StatefulSet"} {
+		t.Run(kind, func(t *testing.T) {
+			for _, existing := range []bool{false, true} {
+				t.Run(fmt.Sprintf("existing_group=%v", existing), func(t *testing.T) {
+					ctx := context.Background()
+					c := newFakeController()
+					t.Cleanup(c.queue.ShutDown)
+					t.Cleanup(c.workloadQueue.ShutDown)
+					obj, pod := rolloutObjects(kind, 3)
+					obj.(metav1.Object).SetAnnotations(map[string]string{scheduling.VolcanoGroupMinMemberAnnotationKey: "3", scheduling.PodPreemptable: "false"})
+					storeRolloutWorkload(t, c, obj)
+					_, err := c.kubeClient.CoreV1().Pods(pod.Namespace).Create(ctx, pod, metav1.CreateOptions{})
+					require.NoError(t, err)
+					require.NoError(t, c.podInformer.Informer().GetIndexer().Add(pod.DeepCopy()))
+					name := helpers.GeneratePodgroupName(pod)
+					before := c.buildPodGroupFromPod(pod, name, obj.(metav1.Object).GetAnnotations())
+					if existing {
+						_, err = c.vcClient.SchedulingV1beta1().PodGroups(pod.Namespace).Create(ctx, before, metav1.CreateOptions{})
+						require.NoError(t, err)
+						require.NoError(t, c.pgInformer.Informer().GetIndexer().Add(before.DeepCopy()))
+					}
+					failed := false
+					c.kubeClient.(*kubeclient.Clientset).PrependReactor("get", strings.ToLower(kind)+"s", func(k8stesting.Action) (bool, runtime.Object, error) {
+						if !failed {
+							failed = true
+							return true, nil, apierrors.NewServiceUnavailable("transient owner read failure")
+						}
+						return false, nil, nil
+					})
+					c.addPod(pod)
+					require.True(t, c.processNextReq())
+					req := podRequest{podName: pod.Name, podNamespace: pod.Namespace, podUID: pod.UID}
+					require.Equal(t, 1, c.queue.NumRequeues(req))
+					stored, err := c.vcClient.SchedulingV1beta1().PodGroups(pod.Namespace).Get(ctx, name, metav1.GetOptions{})
+					if existing {
+						require.NoError(t, err)
+						assert.Equal(t, before.Spec, stored.Spec)
+						assert.Equal(t, before.Annotations, stored.Annotations)
+					} else {
+						require.True(t, apierrors.IsNotFound(err))
+					}
+					require.True(t, c.processNextReq())
+					assert.Zero(t, c.queue.NumRequeues(req))
+					stored, err = c.vcClient.SchedulingV1beta1().PodGroups(pod.Namespace).Get(ctx, name, metav1.GetOptions{})
+					require.NoError(t, err)
+					assert.EqualValues(t, 3, stored.Spec.MinMember)
+					assert.Equal(t, before.Spec.MinResources, stored.Spec.MinResources)
+					assert.Equal(t, before.Annotations, stored.Annotations)
+				})
+			}
+		})
+	}
+}
+
+func TestSyncWorkloadAdditionalOwnerReadFailure(t *testing.T) {
+	for _, kind := range []string{"ReplicaSet", "StatefulSet"} {
+		t.Run(kind, func(t *testing.T) {
+			ctx := context.Background()
+			c := newFakeController()
+			t.Cleanup(c.queue.ShutDown)
+			t.Cleanup(c.workloadQueue.ShutDown)
+			obj, pod := rolloutObjects(kind, 3)
+			primaryAnnotations := map[string]string{scheduling.VolcanoGroupMinMemberAnnotationKey: "3"}
+			obj.(metav1.Object).SetAnnotations(primaryAnnotations)
+			storeRolloutWorkload(t, c, obj)
+			secondaryKey := scheduling.AnnotationPrefix + "secondary"
+			secondary := &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{
+				Name: "secondary-owner", Namespace: pod.Namespace, UID: "secondary-uid",
+				Annotations: map[string]string{secondaryKey: "inherited-value"},
+			}}
+			_, err := c.kubeClient.AppsV1().DaemonSets(pod.Namespace).Create(ctx, secondary, metav1.CreateOptions{})
+			require.NoError(t, err)
+			pod.OwnerReferences = append(pod.OwnerReferences, metav1.OwnerReference{APIVersion: "apps/v1", Kind: "DaemonSet", Name: secondary.Name, UID: secondary.UID})
+			_, err = c.kubeClient.CoreV1().Pods(pod.Namespace).Create(ctx, pod, metav1.CreateOptions{})
+			require.NoError(t, err)
+			name := helpers.GeneratePodgroupName(pod)
+			before := c.buildPodGroupFromPod(pod, name, map[string]string{
+				scheduling.VolcanoGroupMinMemberAnnotationKey: "3", secondaryKey: "inherited-value",
+			})
+			_, err = c.vcClient.SchedulingV1beta1().PodGroups(pod.Namespace).Create(ctx, before, metav1.CreateOptions{})
+			require.NoError(t, err)
+			require.NoError(t, c.pgInformer.Informer().GetIndexer().Add(before.DeepCopy()))
+			failed := false
+			c.kubeClient.(*kubeclient.Clientset).PrependReactor("get", "daemonsets", func(k8stesting.Action) (bool, runtime.Object, error) {
+				if !failed {
+					failed = true
+					return true, nil, apierrors.NewServiceUnavailable("additional owner unavailable")
+				}
+				return false, nil, nil
+			})
+			enqueueRolloutWorkload(c, obj)
+			require.True(t, c.processNextWorkload())
+			req := workloadRequest{kind: kind, namespace: pod.Namespace, name: "workload", uid: "workload-uid"}
+			require.Equal(t, 1, c.workloadQueue.NumRequeues(req))
+			stored, err := c.vcClient.SchedulingV1beta1().PodGroups(pod.Namespace).Get(ctx, name, metav1.GetOptions{})
+			require.NoError(t, err)
+			assert.Equal(t, before.Spec, stored.Spec)
+			assert.Equal(t, before.Annotations, stored.Annotations)
+			require.True(t, c.processNextWorkload())
+			assert.Zero(t, c.workloadQueue.NumRequeues(req))
+			stored, err = c.vcClient.SchedulingV1beta1().PodGroups(pod.Namespace).Get(ctx, name, metav1.GetOptions{})
+			require.NoError(t, err)
+			assert.Equal(t, before.Spec, stored.Spec)
+			assert.Equal(t, before.Annotations, stored.Annotations)
 		})
 	}
 }
@@ -340,7 +519,7 @@ func TestDeletePodGroup(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, c.podInformer.Informer().GetIndexer().Add(pod))
 			name := helpers.GeneratePodgroupName(pod)
-			group := c.buildPodGroupFromPod(pod, name).DeepCopy()
+			group := c.buildPodGroupFromPod(pod, name, nil).DeepCopy()
 			if tt.customGroup {
 				group.Name = "external-group"
 			}
@@ -413,7 +592,7 @@ func TestProcessNextReqWithAnnotatedPod(t *testing.T) {
 			require.NoError(t, c.podInformer.Informer().GetIndexer().Add(pod))
 			name := helpers.GeneratePodgroupName(pod)
 			if tt.existingGroup {
-				group := c.buildPodGroupFromPod(pod, name).DeepCopy()
+				group := c.buildPodGroupFromPod(pod, name, nil).DeepCopy()
 				if tt.deletingGroup {
 					group.DeletionTimestamp = ptr.To(metav1.Now())
 				}
@@ -455,7 +634,7 @@ func TestPodEventsCleanUpScaledDownWorkload(t *testing.T) {
 			_, err := c.kubeClient.CoreV1().Pods(pod.Namespace).Create(ctx, pod, metav1.CreateOptions{})
 			require.NoError(t, err)
 			name := helpers.GeneratePodgroupName(pod)
-			_, err = c.vcClient.SchedulingV1beta1().PodGroups(pod.Namespace).Create(ctx, c.buildPodGroupFromPod(pod, name), metav1.CreateOptions{})
+			_, err = c.vcClient.SchedulingV1beta1().PodGroups(pod.Namespace).Create(ctx, c.buildPodGroupFromPod(pod, name, nil), metav1.CreateOptions{})
 			require.NoError(t, err)
 			enqueueRolloutWorkload(c, workload)
 			require.True(t, c.processNextWorkload())
@@ -490,7 +669,7 @@ func TestWorkloadPodGroupDeletionRace(t *testing.T) {
 			rs := obj.(*appsv1.ReplicaSet)
 			storeRolloutWorkload(t, c, rs)
 			name := helpers.GeneratePodgroupName(pod)
-			group := c.buildPodGroupFromPod(pod, name)
+			group := c.buildPodGroupFromPod(pod, name, nil)
 			group.UID, group.ResourceVersion = "old-group-uid", "1"
 			_, err := c.vcClient.SchedulingV1beta1().PodGroups(rs.Namespace).Create(ctx, group, metav1.CreateOptions{})
 			require.NoError(t, err)
