@@ -82,6 +82,10 @@ func TestAddPodGroup(t *testing.T) {
 	}{
 		{
 			name: "AddPodGroup: pod has ownerReferences and priorityClassName",
+			rs: &appsv1.ReplicaSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "rs1", Namespace: namespace, UID: "7a09885b-b753-4924-9fba-77c0836bac20"},
+				Spec:       appsv1.ReplicaSetSpec{Replicas: &replicas, Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "rs1"}}},
+			},
 			pods: []*v1.Pod{
 				{
 					TypeMeta: metav1.TypeMeta{
@@ -93,7 +97,7 @@ func TestAddPodGroup(t *testing.T) {
 						Namespace: namespace,
 						OwnerReferences: []metav1.OwnerReference{
 							{
-								APIVersion: "app/v1",
+								APIVersion: "apps/v1",
 								Kind:       "ReplicaSet",
 								Name:       "rs1",
 								UID:        "7a09885b-b753-4924-9fba-77c0836bac20",
@@ -116,7 +120,7 @@ func TestAddPodGroup(t *testing.T) {
 					Namespace: namespace,
 					OwnerReferences: []metav1.OwnerReference{
 						{
-							APIVersion: "app/v1",
+							APIVersion: "apps/v1",
 							Kind:       "ReplicaSet",
 							Name:       "rs1",
 							UID:        "7a09885b-b753-4924-9fba-77c0836bac20",
@@ -221,7 +225,7 @@ func TestAddPodGroup(t *testing.T) {
 						},
 						OwnerReferences: []metav1.OwnerReference{
 							{
-								APIVersion: "app/v1",
+								APIVersion: "apps/v1",
 								Kind:       "ReplicaSet",
 								Name:       "rs1",
 								UID:        "7a09885b-b753-4924-9fba-77c0836bac20",
@@ -255,7 +259,7 @@ func TestAddPodGroup(t *testing.T) {
 						},
 						OwnerReferences: []metav1.OwnerReference{
 							{
-								APIVersion: "app/v1",
+								APIVersion: "apps/v1",
 								Kind:       "ReplicaSet",
 								Name:       "rs1",
 								UID:        "7a09885b-b753-4924-9fba-77c0836bac20",
@@ -287,7 +291,7 @@ func TestAddPodGroup(t *testing.T) {
 					Namespace: namespace,
 					OwnerReferences: []metav1.OwnerReference{
 						{
-							APIVersion: "app/v1",
+							APIVersion: "apps/v1",
 							Kind:       "ReplicaSet",
 							Name:       "rs1",
 							UID:        "7a09885b-b753-4924-9fba-77c0836bac20",
@@ -517,7 +521,7 @@ func Test_createOrUpdateNormalPodPG(t *testing.T) {
 				},
 				OwnerReferences: []metav1.OwnerReference{
 					{
-						APIVersion: "app/v1",
+						APIVersion: "apps/v1",
 						Kind:       "StatefulSet",
 						Name:       "sts1",
 						UID:        "7a09885b-b753-4924-9fba-77c0836bac20",
@@ -596,7 +600,7 @@ func Test_createOrUpdateNormalPodPG(t *testing.T) {
 				Namespace: namespace,
 				OwnerReferences: []metav1.OwnerReference{
 					{
-						APIVersion: "app/v1",
+						APIVersion: "apps/v1",
 						Kind:       "StatefulSet",
 						Name:       "sts1",
 						UID:        "7a09885b-b753-4924-9fba-77c0836bac20",
@@ -656,7 +660,7 @@ func Test_createOrUpdateNormalPodPG(t *testing.T) {
 				},
 				OwnerReferences: []metav1.OwnerReference{
 					{
-						APIVersion: "app/v1",
+						APIVersion: "apps/v1",
 						Kind:       "StatefulSet",
 						Name:       "sts1",
 						UID:        "7a09885b-b753-4924-9fba-77c0836bac20",
@@ -735,7 +739,7 @@ func Test_createOrUpdateNormalPodPG(t *testing.T) {
 				Namespace: namespace,
 				OwnerReferences: []metav1.OwnerReference{
 					{
-						APIVersion: "app/v1",
+						APIVersion: "apps/v1",
 						Kind:       "StatefulSet",
 						Name:       "sts1",
 						UID:        "7a09885b-b753-4924-9fba-77c0836bac20",
@@ -766,7 +770,7 @@ func Test_createOrUpdateNormalPodPG(t *testing.T) {
 				Namespace: namespace,
 				OwnerReferences: []metav1.OwnerReference{
 					{
-						APIVersion: "app/v1",
+						APIVersion: "apps/v1",
 						Kind:       "StatefulSet",
 						Name:       "sts1",
 						UID:        "7a09885b-b753-4924-9fba-77c0836bac20",
@@ -853,7 +857,10 @@ func Test_pgcontroller_buildPodGroupFromPod(t *testing.T) {
 		}
 
 		// Execute test function
-		resultPG := c.buildPodGroupFromPod(pod, pgName)
+		resultPG, err := c.buildPodGroupFromPod(pod, pgName)
+		if err != nil {
+			t.Fatal(err)
+		}
 
 		// Verify basic fields
 		if resultPG == nil {
@@ -964,7 +971,10 @@ func Test_pgcontroller_buildPodGroupFromPod(t *testing.T) {
 		}
 
 		// Execute test function
-		resultPG := c.buildPodGroupFromPod(pod, pgName)
+		resultPG, err := c.buildPodGroupFromPod(pod, pgName)
+		if err != nil {
+			t.Fatal(err)
+		}
 
 		// Verify inherited annotations and MinMember
 		if resultPG.Spec.MinMember != 3 {
@@ -1044,7 +1054,10 @@ func Test_pgcontroller_buildPodGroupFromPod(t *testing.T) {
 		}
 
 		// Execute test function
-		resultPG := c.buildPodGroupFromPod(pod, pgName)
+		resultPG, err := c.buildPodGroupFromPod(pod, pgName)
+		if err != nil {
+			t.Fatal(err)
+		}
 
 		// Verify JDBMaxUnavailable is inherited
 		if resultPG.Annotations[scheduling.JDBMaxUnavailable] != "20%" {
@@ -1096,25 +1109,37 @@ func Test_pgcontroller_updateExistingPodGroup(t *testing.T) {
 		}
 
 		// Execute test function
-		currentPG := c.buildPodGroupFromPod(pod, pgName)
+		currentPG, err := c.buildPodGroupFromPod(pod, pgName)
+		if err != nil {
+			t.Fatal(err)
+		}
 
 		// Spec changed
 		currentPG.Spec.MinMember = 2
-		isUpdated := c.shouldUpdateExistingPodGroup(currentPG, pod)
+		isUpdated, err := c.shouldUpdateExistingPodGroup(currentPG, pod)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if !isUpdated {
 			t.Error("expected isUpdated true, got false")
 		}
 
 		// Labels changed
 		currentPG.Labels[scheduling.CooldownTime] = "120s"
-		isUpdated = c.shouldUpdateExistingPodGroup(currentPG, pod)
+		isUpdated, err = c.shouldUpdateExistingPodGroup(currentPG, pod)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if !isUpdated {
 			t.Error("expected isUpdated true, got false")
 		}
 
 		// Annotations changed
 		currentPG.Annotations[scheduling.PodPreemptable] = "false"
-		isUpdated = c.shouldUpdateExistingPodGroup(currentPG, pod)
+		isUpdated, err = c.shouldUpdateExistingPodGroup(currentPG, pod)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if !isUpdated {
 			t.Error("expected isUpdated true, got false")
 		}
@@ -1252,7 +1277,10 @@ func TestBuildPodGroupFromPodWithNetworkTopology(t *testing.T) {
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
 			pgName := "test-podgroup"
-			podGroup := controller.buildPodGroupFromPod(testCase.pod, pgName)
+			podGroup, err := controller.buildPodGroupFromPod(testCase.pod, pgName)
+			if !assert.NoError(t, err) {
+				return
+			}
 
 			assert.NotNil(t, podGroup)
 			assert.Equal(t, pgName, podGroup.Name)

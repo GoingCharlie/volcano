@@ -19,6 +19,7 @@ package podgroup
 import (
 	"slices"
 
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
@@ -30,6 +31,7 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 
+	"volcano.sh/apis/pkg/apis/helpers"
 	scheduling "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	vcclientset "volcano.sh/apis/pkg/client/clientset/versioned"
 	vcinformer "volcano.sh/apis/pkg/client/informers/externalversions"
@@ -98,6 +100,9 @@ func (pg *pgcontroller) Initialize(opt *framework.ControllerOption) error {
 	pg.vcInformerFactory = factory
 	pg.pgInformer = factory.Scheduling().V1beta1().PodGroups()
 	pg.pgLister = pg.pgInformer.Lister()
+	pg.pgInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		DeleteFunc: pg.deletePodGroup,
+	})
 
 	if utilfeature.DefaultFeatureGate.Enabled(features.WorkLoadSupport) {
 		pg.rsInformer = pg.informerFactory.Apps().V1().ReplicaSets()
@@ -152,6 +157,19 @@ func (pg *pgcontroller) processNextReq() bool {
 	}
 
 	defer pg.queue.Done(req)
+	if req.cleanup.kind != "" {
+		pending, err := pg.cleanupPodGroup(req.cleanup)
+		if err != nil {
+			klog.Errorf("Failed to clean up PodGroup for %s %s/%s: %v", req.cleanup.kind, req.cleanup.namespace, req.cleanup.name, err)
+			pg.queue.AddRateLimited(req)
+		} else {
+			pg.queue.Forget(req)
+			if pending {
+				pg.queue.AddAfter(req, podGroupCleanupRetryInterval)
+			}
+		}
+		return true
+	}
 
 	pod, err := pg.podLister.Pods(req.podNamespace).Get(req.podName)
 	if err != nil {
@@ -168,8 +186,10 @@ func (pg *pgcontroller) processNextReq() bool {
 		return true
 	}
 
-	if pod.Annotations != nil && pod.Annotations[scheduling.KubeGroupNameAnnotationKey] != "" {
-		klog.V(5).Infof("pod %v/%v has created podgroup", pod.Namespace, pod.Name)
+	if pod.DeletionTimestamp != nil || pod.Status.Phase == v1.PodSucceeded || pod.Status.Phase == v1.PodFailed {
+		return true
+	}
+	if name := pod.Annotations[scheduling.KubeGroupNameAnnotationKey]; name != "" && name != helpers.GeneratePodgroupName(pod) {
 		return true
 	}
 

@@ -19,17 +19,22 @@ package podgroup
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
 	batchv1alpha1 "volcano.sh/apis/pkg/apis/batch/v1alpha1"
@@ -41,12 +46,21 @@ import (
 
 const (
 	controllerRevisionHashLabelKey = "controller-revision-hash"
+	podGroupCleanupRetryInterval   = 5 * time.Second
 )
+
+type cleanupRequest struct {
+	kind      string
+	namespace string
+	name      string
+	uid       types.UID
+}
 
 type podRequest struct {
 	podName      string
 	podNamespace string
 	podUID       types.UID
+	cleanup      cleanupRequest
 }
 
 func (pg *pgcontroller) addPod(obj interface{}) {
@@ -73,13 +87,8 @@ func (pg *pgcontroller) addReplicaSet(obj interface{}) {
 	}
 
 	if *rs.Spec.Replicas == 0 {
-		pgName := batchv1alpha1.PodgroupNamePrefix + string(rs.UID)
-		klog.V(4).Infof("Delete podgroup %s for replicaset %s/%s spec.replicas == 0",
-			pgName, rs.Namespace, rs.Name)
-		err := pg.vcClient.SchedulingV1beta1().PodGroups(rs.Namespace).Delete(context.TODO(), pgName, metav1.DeleteOptions{})
-		if err != nil && !apierrors.IsNotFound(err) {
-			klog.Errorf("Failed to delete PodGroup <%s/%s>: %v", rs.Namespace, pgName, err)
-		}
+		pg.enqueueCleanup("ReplicaSet", rs)
+		return
 	}
 
 	// In the rolling upgrade scenario, the addReplicasSet(replicas=0) event may be received before
@@ -126,11 +135,8 @@ func (pg *pgcontroller) addStatefulSet(obj interface{}) {
 	}
 
 	if *sts.Spec.Replicas == 0 {
-		pgName := batchv1alpha1.PodgroupNamePrefix + string(sts.UID)
-		err := pg.vcClient.SchedulingV1beta1().PodGroups(sts.Namespace).Delete(context.TODO(), pgName, metav1.DeleteOptions{})
-		if err != nil && !apierrors.IsNotFound(err) {
-			klog.Errorf("Failed to delete PodGroup <%s/%s>: %v", sts.Namespace, pgName, err)
-		}
+		pg.enqueueCleanup("StatefulSet", sts)
+		return
 	}
 
 	// In the rolling upgrade scenario, the addStatefulSet(replicas=0) event may be received before
@@ -180,6 +186,106 @@ func (pg *pgcontroller) updateStatefulSet(oldObj, newObj interface{}) {
 	pg.addStatefulSet(newObj)
 }
 
+func (pg *pgcontroller) enqueueCleanup(kind string, owner metav1.Object) {
+	pg.queue.Add(podRequest{cleanup: cleanupRequest{
+		kind: kind, namespace: owner.GetNamespace(), name: owner.GetName(), uid: owner.GetUID(),
+	}})
+}
+
+// Cleanup retries carry the workload identity, so they still work after its
+// last Pod disappears and no further workload status updates are emitted.
+func (pg *pgcontroller) cleanupPodGroup(req cleanupRequest) (bool, error) {
+	var owner metav1.Object
+	var replicas *int32
+	var err error
+	switch req.kind {
+	case "ReplicaSet":
+		var rs *appsv1.ReplicaSet
+		rs, err = pg.kubeClient.AppsV1().ReplicaSets(req.namespace).Get(context.TODO(), req.name, metav1.GetOptions{})
+		if err == nil {
+			owner, replicas = rs, rs.Spec.Replicas
+		}
+	case "StatefulSet":
+		var sts *appsv1.StatefulSet
+		sts, err = pg.kubeClient.AppsV1().StatefulSets(req.namespace).Get(context.TODO(), req.name, metav1.GetOptions{})
+		if err == nil {
+			owner, replicas = sts, sts.Spec.Replicas
+		}
+	default:
+		return false, nil
+	}
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if owner.GetUID() != req.uid || replicas == nil || *replicas != 0 {
+		return false, nil
+	}
+	return pg.deleteUnusedPodGroup(owner)
+}
+
+// Delete only after the current workload is scaled down and its nonterminal
+// pods have disappeared. A zero-replica notification alone can be stale.
+// The boolean result requests a later check while member pods still exist.
+func (pg *pgcontroller) deleteUnusedPodGroup(owner metav1.Object) (bool, error) {
+	name := batchv1alpha1.PodgroupNamePrefix + string(owner.GetUID())
+	groups := pg.vcClient.SchedulingV1beta1().PodGroups(owner.GetNamespace())
+	group, err := groups.Get(context.TODO(), name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !metav1.IsControlledBy(group, owner) {
+		return false, nil
+	}
+	pods, err := pg.kubeClient.CoreV1().Pods(owner.GetNamespace()).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return false, err
+	}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if metav1.IsControlledBy(pod, owner) && pod.Status.Phase != v1.PodSucceeded && pod.Status.Phase != v1.PodFailed {
+			return true, nil
+		}
+	}
+	err = groups.Delete(context.TODO(), name, metav1.DeleteOptions{
+		Preconditions: &metav1.Preconditions{UID: &group.UID, ResourceVersion: &group.ResourceVersion},
+	})
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+func (pg *pgcontroller) deletePodGroup(obj interface{}) {
+	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		obj = tombstone.Obj
+	}
+	group, ok := obj.(*scheduling.PodGroup)
+	if !ok {
+		return
+	}
+	owner := metav1.GetControllerOf(group)
+	if owner == nil || group.Name != batchv1alpha1.PodgroupNamePrefix+string(owner.UID) {
+		return
+	}
+	pods, err := pg.podLister.Pods(group.Namespace).List(labels.Everything())
+	if err != nil {
+		klog.Errorf("Failed to list pods for deleted PodGroup %s: %v", klog.KObj(group), err)
+		return
+	}
+	for _, pod := range pods {
+		name := pod.Annotations[scheduling.KubeGroupNameAnnotationKey]
+		if (name == "" || name == group.Name) && helpers.GeneratePodgroupName(pod) == group.Name {
+			pg.addPod(pod)
+		}
+	}
+}
+
 func (pg *pgcontroller) updatePodAnnotations(pod *v1.Pod, pgName string) error {
 	if pod.Annotations[scheduling.KubeGroupNameAnnotationKey] == "" {
 		patch := map[string]any{
@@ -211,52 +317,36 @@ func (pg *pgcontroller) updatePodAnnotations(pod *v1.Pod, pgName string) error {
 	return nil
 }
 
-func (pg *pgcontroller) getAnnotationsFromUpperRes(pod *v1.Pod) map[string]string {
-	var annotations = make(map[string]string)
-
+func (pg *pgcontroller) getAnnotationsFromUpperRes(pod *v1.Pod) (map[string]string, error) {
+	annotations := make(map[string]string)
 	for _, reference := range pod.OwnerReferences {
-		if reference.Kind != "" && reference.Name != "" {
-			tmp := make(map[string]string)
-			switch reference.Kind {
-			case "ReplicaSet":
-				rs, err := pg.kubeClient.AppsV1().ReplicaSets(pod.Namespace).Get(context.TODO(), reference.Name, metav1.GetOptions{})
-				if err != nil {
-					klog.Errorf("Failed to get upper %s for Pod <%s/%s>: %v", reference.Kind, pod.Namespace, reference.Name, err)
-					continue
-				}
-				tmp = rs.Annotations
-			case "DaemonSet":
-				ds, err := pg.kubeClient.AppsV1().DaemonSets(pod.Namespace).Get(context.TODO(), reference.Name, metav1.GetOptions{})
-				if err != nil {
-					klog.Errorf("Failed to get upper %s for Pod <%s/%s>: %v", reference.Kind, pod.Namespace, reference.Name, err)
-					continue
-				}
-				tmp = ds.Annotations
-			case "StatefulSet":
-				ss, err := pg.kubeClient.AppsV1().StatefulSets(pod.Namespace).Get(context.TODO(), reference.Name, metav1.GetOptions{})
-				if err != nil {
-					klog.Errorf("Failed to get upper %s for Pod <%s/%s>: %v", reference.Kind, pod.Namespace, reference.Name, err)
-					continue
-				}
-				tmp = ss.Annotations
-			case "Job":
-				job, err := pg.kubeClient.BatchV1().Jobs(pod.Namespace).Get(context.TODO(), reference.Name, metav1.GetOptions{})
-				if err != nil {
-					klog.Errorf("Failed to get upper %s for Pod <%s/%s>: %v", reference.Kind, pod.Namespace, reference.Name, err)
-					continue
-				}
-				tmp = job.Annotations
-			}
-
-			for k, v := range tmp {
-				if _, ok := annotations[k]; !ok {
-					annotations[k] = v
-				}
+		var owner metav1.Object
+		var err error
+		switch schema.FromAPIVersionAndKind(reference.APIVersion, reference.Kind).GroupKind() {
+		case appsv1.SchemeGroupVersion.WithKind("ReplicaSet").GroupKind():
+			owner, err = pg.kubeClient.AppsV1().ReplicaSets(pod.Namespace).Get(context.TODO(), reference.Name, metav1.GetOptions{})
+		case appsv1.SchemeGroupVersion.WithKind("DaemonSet").GroupKind():
+			owner, err = pg.kubeClient.AppsV1().DaemonSets(pod.Namespace).Get(context.TODO(), reference.Name, metav1.GetOptions{})
+		case appsv1.SchemeGroupVersion.WithKind("StatefulSet").GroupKind():
+			owner, err = pg.kubeClient.AppsV1().StatefulSets(pod.Namespace).Get(context.TODO(), reference.Name, metav1.GetOptions{})
+		case batchv1.SchemeGroupVersion.WithKind("Job").GroupKind():
+			owner, err = pg.kubeClient.BatchV1().Jobs(pod.Namespace).Get(context.TODO(), reference.Name, metav1.GetOptions{})
+		default:
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("get %s %s/%s for Pod %s: %w", reference.Kind, pod.Namespace, reference.Name, pod.Name, err)
+		}
+		if owner.GetUID() != reference.UID {
+			return nil, fmt.Errorf("%s %s/%s UID does not match Pod %s owner", reference.Kind, pod.Namespace, reference.Name, pod.Name)
+		}
+		for k, v := range owner.GetAnnotations() {
+			if _, ok := annotations[k]; !ok {
+				annotations[k] = v
 			}
 		}
 	}
-
-	return annotations
+	return annotations, nil
 }
 
 func (pg *pgcontroller) getMinMemberFromUpperRes(upperAnnotations map[string]string, namespance, name string) int32 {
@@ -300,7 +390,29 @@ func (pg *pgcontroller) createNormalPodPGIfNotExist(pod *v1.Pod) error {
 			return err
 		}
 
-		podGroup := pg.buildPodGroupFromPod(pod, pgName)
+		// A group deletion can be observed before the Pod informer catches up.
+		// Revalidate only before creation; existing groups remain read-only.
+		current, err := pg.kubeClient.CoreV1().Pods(pod.Namespace).Get(context.TODO(), pod.Name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if current.UID != pod.UID ||
+			current.DeletionTimestamp != nil || current.Status.Phase == v1.PodSucceeded || current.Status.Phase == v1.PodFailed ||
+			helpers.GeneratePodgroupName(current) != pgName {
+			return nil
+		}
+		if name := current.Annotations[scheduling.KubeGroupNameAnnotationKey]; name != "" && name != pgName {
+			return nil
+		}
+		pod = current
+
+		podGroup, err := pg.buildPodGroupFromPod(pod, pgName)
+		if err != nil {
+			return err
+		}
 		if _, err := pg.vcClient.SchedulingV1beta1().PodGroups(pod.Namespace).Create(context.TODO(), podGroup, metav1.CreateOptions{}); err != nil {
 			if !apierrors.IsAlreadyExists(err) {
 				klog.Errorf("Failed to create normal PodGroup for Pod <%s/%s>: %v",
@@ -313,6 +425,16 @@ func (pg *pgcontroller) createNormalPodPGIfNotExist(pod *v1.Pod) error {
 		} else {
 			klog.V(4).Infof("PodGroup <%s/%s> created for Pod <%s/%s>",
 				pod.Namespace, pgName, pod.Namespace, pod.Name)
+			// The Pod may disappear after the GET but before CREATE. Reuse the
+			// cleanup queue so a concurrently scaled-down owner cannot leak a group.
+			if owner := metav1.GetControllerOf(pod); owner != nil {
+				switch schema.FromAPIVersionAndKind(owner.APIVersion, owner.Kind).GroupKind() {
+				case appsv1.SchemeGroupVersion.WithKind("ReplicaSet").GroupKind(), appsv1.SchemeGroupVersion.WithKind("StatefulSet").GroupKind():
+					pg.queue.AddAfter(podRequest{cleanup: cleanupRequest{
+						kind: owner.Kind, namespace: pod.Namespace, name: owner.Name, uid: owner.UID,
+					}}, podGroupCleanupRetryInterval)
+				}
+			}
 		}
 	}
 
@@ -331,7 +453,10 @@ func (pg *pgcontroller) createOrUpdateNormalPodPG(pod *v1.Pod) error {
 			return err
 		}
 
-		newPodGroup := pg.buildPodGroupFromPod(pod, pgName)
+		newPodGroup, err := pg.buildPodGroupFromPod(pod, pgName)
+		if err != nil {
+			return err
+		}
 		if _, err := pg.vcClient.SchedulingV1beta1().PodGroups(pod.Namespace).Create(context.TODO(), newPodGroup, metav1.CreateOptions{}); err != nil {
 			if !apierrors.IsAlreadyExists(err) {
 				klog.Errorf("Failed to create normal PodGroup for Pod <%s/%s>: %v",
@@ -347,7 +472,10 @@ func (pg *pgcontroller) createOrUpdateNormalPodPG(pod *v1.Pod) error {
 		}
 	} else {
 		podGroupToUpdate := podGroup.DeepCopy()
-		needUpdate := pg.shouldUpdateExistingPodGroup(podGroupToUpdate, pod)
+		needUpdate, err := pg.shouldUpdateExistingPodGroup(podGroupToUpdate, pod)
+		if err != nil {
+			return err
+		}
 		if needUpdate {
 			_, err = pg.vcClient.SchedulingV1beta1().PodGroups(pod.Namespace).Update(context.TODO(), podGroupToUpdate, metav1.UpdateOptions{})
 			if err != nil {
@@ -361,11 +489,15 @@ func (pg *pgcontroller) createOrUpdateNormalPodPG(pod *v1.Pod) error {
 	return pg.updatePodAnnotations(pod, pgName)
 }
 
-func (pg *pgcontroller) buildPodGroupFromPod(pod *v1.Pod, pgName string) *scheduling.PodGroup {
+func (pg *pgcontroller) buildPodGroupFromPod(pod *v1.Pod, pgName string) (*scheduling.PodGroup, error) {
 	var minMember = int32(1)
 	var ownerAnnotations = make(map[string]string)
 	if pg.inheritOwnerAnnotations {
-		ownerAnnotations = pg.getAnnotationsFromUpperRes(pod)
+		var err error
+		ownerAnnotations, err = pg.getAnnotationsFromUpperRes(pod)
+		if err != nil {
+			return nil, err
+		}
 		minMember = pg.getMinMemberFromUpperRes(ownerAnnotations, pod.Namespace, pod.Name)
 	}
 	minResources := util.CalTaskRequests(pod, minMember)
@@ -427,7 +559,7 @@ func (pg *pgcontroller) buildPodGroupFromPod(pod *v1.Pod, pgName string) *schedu
 			obj.Namespace, obj.Name, networkTopology.Mode, highestTier)
 	}
 
-	return obj
+	return obj, nil
 }
 
 // parseNetworkTopologyFromPod extracts NetworkTopology configuration from Pod annotations
@@ -471,10 +603,13 @@ func parseNetworkTopologyFromPod(pod *v1.Pod) *scheduling.NetworkTopologySpec {
 	return nt
 }
 
-func (pg *pgcontroller) shouldUpdateExistingPodGroup(podGroup *scheduling.PodGroup, pod *v1.Pod) bool {
+func (pg *pgcontroller) shouldUpdateExistingPodGroup(podGroup *scheduling.PodGroup, pod *v1.Pod) (bool, error) {
 	isUpdated := false
 
-	newPodGroup := pg.buildPodGroupFromPod(pod, podGroup.Name)
+	newPodGroup, err := pg.buildPodGroupFromPod(pod, podGroup.Name)
+	if err != nil {
+		return false, err
+	}
 	if !reflect.DeepEqual(newPodGroup.Spec, podGroup.Spec) {
 		podGroup.Spec = newPodGroup.Spec
 		isUpdated = true
@@ -490,7 +625,7 @@ func (pg *pgcontroller) shouldUpdateExistingPodGroup(podGroup *scheduling.PodGro
 		isUpdated = true
 	}
 
-	return isUpdated
+	return isUpdated, nil
 }
 
 func newPGOwnerReferences(pod *v1.Pod) []metav1.OwnerReference {
