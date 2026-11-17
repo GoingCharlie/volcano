@@ -209,6 +209,98 @@ func TestSyncWorkloadPodOwnership(t *testing.T) {
 	}
 }
 
+func TestSyncWorkloadQueue(t *testing.T) {
+	tests := []struct {
+		name           string
+		namespaceQueue string
+		podQueue       *string
+		existingGroup  bool
+		cachedGroup    bool
+		wantQueue      string
+	}{
+		{name: "new group keeps queue resolved at admission", namespaceQueue: "namespace-queue", wantQueue: "namespace-queue"},
+		{name: "cached group keeps inherited queue during spec update", namespaceQueue: "namespace-queue", existingGroup: true, cachedGroup: true, wantQueue: "namespace-queue"},
+		{name: "uncached group keeps inherited queue after AlreadyExists", namespaceQueue: "namespace-queue", existingGroup: true, wantQueue: "namespace-queue"},
+		{name: "empty pod queue keeps inherited queue", namespaceQueue: "namespace-queue", podQueue: ptr.To(""), existingGroup: true, cachedGroup: true, wantQueue: "namespace-queue"},
+		{name: "explicit pod queue updates existing group", namespaceQueue: "namespace-queue", podQueue: ptr.To("pod-queue"), existingGroup: true, cachedGroup: true, wantQueue: "pod-queue"},
+		{name: "explicit default queue updates existing group", namespaceQueue: "namespace-queue", podQueue: ptr.To(scheduling.DefaultQueue), existingGroup: true, cachedGroup: true, wantQueue: scheduling.DefaultQueue},
+		{name: "existing default queue is preserved", existingGroup: true, cachedGroup: true, wantQueue: scheduling.DefaultQueue},
+		{name: "new group keeps schema default queue", wantQueue: scheduling.DefaultQueue},
+		{name: "new group uses explicit pod queue", namespaceQueue: "namespace-queue", podQueue: ptr.To("pod-queue"), wantQueue: "pod-queue"},
+	}
+	for _, kind := range []string{"ReplicaSet", "StatefulSet"} {
+		t.Run(kind, func(t *testing.T) {
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					ctx := context.Background()
+					c := newFakeController()
+					t.Cleanup(c.queue.ShutDown)
+					t.Cleanup(c.workloadQueue.ShutDown)
+					workload, pod := rolloutObjects(kind, 1)
+					workload.(metav1.Object).SetAnnotations(map[string]string{scheduling.VolcanoGroupMinMemberAnnotationKey: "2"})
+					storeRolloutWorkload(t, c, workload)
+					ns := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: pod.Namespace}}
+					if tt.namespaceQueue != "" {
+						ns.Annotations = map[string]string{scheduling.QueueNameAnnotationKey: tt.namespaceQueue}
+					}
+					_, err := c.kubeClient.CoreV1().Namespaces().Create(ctx, ns, metav1.CreateOptions{})
+					require.NoError(t, err)
+					if tt.podQueue != nil {
+						pod.Annotations[scheduling.QueueNameAnnotationKey] = *tt.podQueue
+					}
+					_, err = c.kubeClient.CoreV1().Pods(pod.Namespace).Create(ctx, pod, metav1.CreateOptions{})
+					require.NoError(t, err)
+
+					// Fake clients do not run CRD defaulting or admission. Emulate
+					// the default queue and the CREATE-only namespace queue webhook
+					// at the API boundary; UPDATE deliberately has no such mutation.
+					client := c.vcClient.(*vcclient.Clientset)
+					client.PrependReactor("create", "podgroups", func(action k8stesting.Action) (bool, runtime.Object, error) {
+						group := action.(k8stesting.CreateAction).GetObject().(*scheduling.PodGroup).DeepCopy()
+						if group.Spec.Queue == "" {
+							group.Spec.Queue = scheduling.DefaultQueue
+						}
+						if group.Spec.Queue == scheduling.DefaultQueue {
+							currentNS, err := c.kubeClient.CoreV1().Namespaces().Get(ctx, group.Namespace, metav1.GetOptions{})
+							if err != nil {
+								return true, nil, err
+							}
+							if queue, ok := currentNS.Annotations[scheduling.QueueNameAnnotationKey]; ok {
+								group.Spec.Queue = queue
+							}
+						}
+						if err := client.Tracker().Create(action.GetResource(), group, group.Namespace); err != nil {
+							return true, nil, err
+						}
+						return true, group, nil
+					})
+					name := helpers.GeneratePodgroupName(pod)
+					if tt.existingGroup {
+						group := c.buildPodGroupFromPod(pod, name)
+						// The workload now requests minMember=2; the existing group
+						// still has its previous requirement and admitted queue.
+						group.Spec.MinMember = 1
+						group.Spec.Queue = scheduling.DefaultQueue
+						created, err := client.SchedulingV1beta1().PodGroups(pod.Namespace).Create(ctx, group, metav1.CreateOptions{})
+						require.NoError(t, err)
+						if tt.cachedGroup {
+							require.NoError(t, c.pgInformer.Informer().GetIndexer().Add(created.DeepCopy()))
+						}
+					}
+					enqueueRolloutWorkload(c, workload)
+					require.True(t, c.processNextWorkload())
+					req := workloadRequest{kind: kind, namespace: pod.Namespace, name: "workload", uid: "workload-uid"}
+					assert.Zero(t, c.workloadQueue.NumRequeues(req))
+					group, err := client.SchedulingV1beta1().PodGroups(pod.Namespace).Get(ctx, name, metav1.GetOptions{})
+					require.NoError(t, err)
+					assert.Equal(t, tt.wantQueue, group.Spec.Queue)
+					assert.EqualValues(t, 2, group.Spec.MinMember)
+				})
+			}
+		})
+	}
+}
+
 func TestDeletePodGroup(t *testing.T) {
 	tests := []struct {
 		name         string
